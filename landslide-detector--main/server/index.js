@@ -1,4 +1,4 @@
-const express = require('express'); 
+const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 
@@ -12,30 +12,21 @@ app.use(express.json());
 
 const fetchWeather = async (lat, lon) => {
     try {
-        // Request hourly values and current weather (weathercode)
-        const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&hourly=temperature_2m,relativehumidity_2m,precipitation&current_weather=true&timezone=UTC`;
+        // Added 'weather_code' to detect Snow/Storms
+        const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m,precipitation,weather_code`;
         const response = await axios.get(url);
-
-        // Prefer current weather time if available, otherwise use latest hourly sample
-        const hourly = response.data.hourly || {};
-        const times = hourly.time || [];
-        const lastIdx = Math.max(0, times.length - 1);
-
-        const temp = (hourly.temperature_2m && hourly.temperature_2m[lastIdx] !== undefined) ? hourly.temperature_2m[lastIdx] : (response.data.current_weather?.temperature ?? 25);
-        const humidity = (hourly.relativehumidity_2m && hourly.relativehumidity_2m[lastIdx] !== undefined) ? hourly.relativehumidity_2m[lastIdx] : 50;
-        const precip = (hourly.precipitation && hourly.precipitation[lastIdx] !== undefined) ? hourly.precipitation[lastIdx] : 0;
-        const code = response.data.current_weather?.weathercode ?? 0;
-
-        return {
-            temp,
-            humidity,
-            rain: precip * 10, // scaled for physics engine
-            precip_real: precip,
-            code
-        };
+        const current = response.data.current;
+        
+        return { 
+            temp: current.temperature_2m, 
+            humidity: current.relative_humidity_2m, 
+            rain: current.precipitation * 10, // Scaled for physics
+            precip_real: current.precipitation,
+            code: current.weather_code // WMO Weather code (0=Clear, 71=Snow, etc.)
+        }; 
     } catch (e) {
         console.error("Weather API Error", e.message);
-        return { temp: 25, humidity: 50, rain: 0, precip_real: 0, code: 0 };
+        return { temp: 25, humidity: 50, rain: 0, precip_real: 0, code: 0 }; 
     }
 };
 
@@ -43,37 +34,25 @@ const fetchSoil = async (lat, lon) => {
     try {
         const url = `https://rest.isric.org/soilgrids/v2.0/properties/query?lat=${lat}&lon=${lon}&property=bdod&property=clay&property=sand&depth=0-5cm`;
         const response = await axios.get(url);
-
-        const props = response.data?.properties;
-
-        // Default fallback
-        if (!props) {
-            return { bulk_density: 130, clay: 33, sand: 33, silt: 34, isWater: false };
-        }
-
-        // SoilGrids v2: properties.layers may exist; if not, try to extract safely
-        const layers = props.layers || [];
-        const getValFromLayers = (name) => {
+        
+        const layers = response.data.properties.layers;
+        const getVal = (name) => {
             const layer = layers.find(l => l.name === name);
-            if (!layer || !layer.depths || !layer.depths[0] || !layer.depths[0].values) return 0;
-            return layer.depths[0].values.mean || 0;
+            if (!layer) return 0;
+            return layer.depths[0].values.mean;
         };
 
-        let clay = getValFromLayers('clay');
-        let sand = getValFromLayers('sand');
-        let bulk_density = getValFromLayers('bdod');
+        // If SoilGrids returns null/zeros, it's likely water or solid rock
+        let clay = getVal('clay');
+        let sand = getVal('sand');
+        let bulk_density = getVal('bdod'); 
 
-        // If layers are empty, attempt to read common alternative shapes
-        if (!clay && props.clay && props.clay.values) clay = props.clay.values.mean || clay;
-        if (!sand && props.sand && props.sand.values) sand = props.sand.values.mean || sand;
-        if (!bulk_density && props.bdod && props.bdod.values) bulk_density = props.bdod.values.mean || bulk_density;
-
-        // If SoilGrids returns null/zeros, consider it water/rock
+        // Check if data is missing (Ocean usually has 0 soil density)
         if (!clay && !sand && !bulk_density) {
             return { bulk_density: 0, clay: 0, sand: 0, silt: 0, isWater: true };
         }
 
-        // Convert to percent-like units (some layers are given in tenths)
+        // Convert to standard units
         clay = clay / 10;
         sand = sand / 10;
         let silt = 100 - clay - sand;
@@ -81,34 +60,31 @@ const fetchSoil = async (lat, lon) => {
 
         return { bulk_density, clay, sand, silt, isWater: false };
     } catch (e) {
-        console.error("Soil API Error", e.message);
         // If API fails completely, assume standard soil but mark uncertain
-        return { bulk_density: 130, clay: 33, sand: 33, silt: 34, isWater: false };
+        return { bulk_density: 130, clay: 33, sand: 33, silt: 34, isWater: false }; 
     }
 };
 
 const calculateSlope = async (lat, lon) => {
     try {
-        const offset = 0.002;
-        // Request elevation for center, north, and east points (three pairs)
+        const offset = 0.002; 
         const url = `https://api.open-meteo.com/v1/elevation?latitude=${lat},${lat + offset},${lat}&longitude=${lon},${lon},${lon + offset}`;
         const response = await axios.get(url);
-        const elevations = response.data?.elevation || [];
+        const elevations = response.data.elevation;
 
-        const h0 = elevations[0] ?? 0;
-        const hNorth = elevations[1] ?? h0;
-        const hEast = elevations[2] ?? h0;
-
-        // Calculate slope using distances approximated for small offsets
-        const dist = 220; // approximate meters for offset
+        const h0 = elevations[0];     
+        
+        // Calculate Slope
+        const hNorth = elevations[1]; 
+        const hEast = elevations[2];  
+        const dist = 220; 
         const dz_dx = (hEast - h0) / dist;
         const dz_dy = (hNorth - h0) / dist;
-        const rise = Math.sqrt(dz_dx * dz_dx + dz_dy * dz_dy);
+        const rise = Math.sqrt(dz_dx*dz_dx + dz_dy*dz_dy);
         const slopeDeg = Math.atan(rise) * (180 / Math.PI);
 
         return { elevation: h0, slope: parseFloat(slopeDeg.toFixed(1)) };
     } catch (e) {
-        console.error("Elevation API Error", e.message);
         return { elevation: 0, slope: 0 };
     }
 };
@@ -121,20 +97,12 @@ const calculateLandslideRisk = (features) => {
     // --- STEP 1: ENVIRONMENT DETECTION ---
 
     // A. Sea / Water Body Check
-    // Water if:
-    //  - Soil API says water (isWater)
-    //  - OR elevation near sea level AND almost flat AND very low bulk_density (no soil)
-    const isSeaOrWater = isWater || (
-        elevation >= -5 && elevation <= 5 &&  // near sea level
-        Math.abs(slope) < 0.5 &&             // basically flat
-        bulk_density < 20                    // almost no soil mass
-    );
-
-    if (isSeaOrWater) {
+    // If elevation is 0 (or below) AND soil data is missing/zero
+    if (isWater || (elevation <= 1 && bulk_density < 10)) {
         return {
             level: "Safe",
-            reason: "🌊 Water body / Sea detected (flat terrain at sea level). This is not a typical land slope.",
-            details: { FoS: 100, cohesion_base: 0, friction_base: 0, cohesion_effective: 0, friction_effective: 0, shear_strength: 0, shear_stress: 0 }
+            reason: "🌊 Ocean/Water Body Detected. This is not land surface.",
+            details: { FoS: 100, cohesion: 0, friction: 0, shear_strength: 0, shear_stress: 0 }
         };
     }
 
@@ -145,7 +113,7 @@ const calculateLandslideRisk = (features) => {
         return {
             level: slope > 30 ? "High" : "Medium",
             reason: "❄️ Ice/Snow detected. Risk is predominantly from Avalanche or Thaw-Slump, not typical soil shear.",
-            details: { FoS: slope > 30 ? 0.9 : 1.5, cohesion_base: 50, friction_base: 10, cohesion_effective: 50, friction_effective: 10, shear_strength: 0, shear_stress: 0 }
+            details: { FoS: slope > 30 ? 0.9 : 1.5, cohesion: 50, friction: 10, shear_strength: 0, shear_stress: 0 }
         };
     }
 
@@ -155,45 +123,26 @@ const calculateLandslideRisk = (features) => {
     const fSand = sand / 100;
     const fSilt = silt / 100;
 
-    // Base soil parameters (material constants)
-    let c = (fClay * 35) + (fSilt * 10) + (fSand * 1);      // ~kPa
-    let phi = (fSand * 34) + (fSilt * 28) + (fClay * 18);   // degrees
+    let c = (fClay * 35) + (fSilt * 10) + (fSand * 1);
+    let phi = (fSand * 34) + (fSilt * 28) + (fClay * 18);
 
-    // --- Saturation / Rain effect on geotech parameters ---
-    // saturationIndex ≈ 0 (dry) → 1 (very wet)
-    let saturationIndex = 0.1; // some natural moisture even if rain low
-    if (rain > 800) saturationIndex = 1.0;
-    else if (rain > 400) saturationIndex = 0.7;
-    else if (rain > 100) saturationIndex = 0.4;
-
-    // Reduce cohesion and friction angle when saturated
-    const c_eff = c * (1 - 0.5 * saturationIndex);         // up to 50% loss in cohesion
-    const phi_eff = phi * (1 - 0.3 * saturationIndex);     // up to 30% loss in friction
-
-    // Prevent negative values
-    const c_used = Math.max(0, c_eff);
-    const phi_used = Math.max(5, phi_eff); // keep at least minimal friction
-
-    // Unit weight (simplified) and normal/shear stresses
-    const gamma = (bulk_density / 100) * 9.81;  // pseudo kN/m³
-    const z = 3.0;                              // failure plane depth (m)
-    const beta = slope * (Math.PI / 180);       // slope angle (rad)
+    const gamma = (bulk_density / 100) * 9.81; 
+    const z = 3.0; 
+    const beta = slope * (Math.PI / 180); 
 
     const sigma = gamma * z * Math.pow(Math.cos(beta), 2); 
     const tau_driving = gamma * z * Math.sin(beta) * Math.cos(beta); 
 
-    // Rain Saturation Logic (pore pressure)
+    // Rain Saturation Logic
     let u = 0;
     if (rain > 800) u = sigma * 0.5; 
     else if (rain > 400) u = sigma * 0.3; 
     else if (rain > 100) u = sigma * 0.1; 
 
     const sigma_effective = Math.max(0, sigma - u);
-    const tanPhi = Math.tan(phi_used * (Math.PI / 180));
-
-    // Use effective cohesion & friction
-    const tau_resisting = c_used + (sigma_effective * tanPhi);
-
+    const tanPhi = Math.tan(phi * (Math.PI / 180));
+    const tau_resisting = c + (sigma_effective * tanPhi);
+    
     let FoS = tau_resisting / (tau_driving + 0.001);
 
     // --- STEP 3: RISK MAPPING ---
@@ -221,27 +170,26 @@ const calculateLandslideRisk = (features) => {
     // Soil Description
     if (fClay > 0.45) sentences.push(`The terrain is Clay-rich (${clay.toFixed(0)}%), which is cohesive but slippery when wet.`);
     else if (fSand > 0.6) sentences.push(`The terrain is Sandy (${sand.toFixed(0)}%), which is loose and prone to washout.`);
-    else sentences.push(`The soil has a balanced mix of sand, silt, and clay, providing moderate stability.`);
+    else sentences.push(`The soil is a Loam mixture (Sand/Silt/Clay), providing moderate stability.`);
 
     // Slope Description
     if (slope > 35) sentences.push(`The slope is extremely steep (${slope}°), making it naturally unstable.`);
     else if (slope < 5) sentences.push(`The land is flat (${slope}°), significantly reducing landslide risk.`);
 
     // Weather Impact
-    if (rain > 400) sentences.push(`⚠️ CRITICAL: Heavy rainfall is saturating the ground, reducing cohesion and friction.`);
-    else if (rain > 100) sentences.push(`Moderate rain detected. Pore pressure is increasing and effective strength is reduced.`);
-
-    const reason = sentences.join(" ");
+    if (rain > 400) sentences.push(`⚠️ CRITICAL: Heavy rainfall is saturating the ground, reducing friction.`);
+    else if (rain > 100) sentences.push(`Moderate rain detected. Pore pressure is increasing.`);
+    
+    // Combine sentences
+    let reason = sentences.join(" ");
 
     return {
         level,
         reason,
         details: {
-            FoS,
-            cohesion_base: Number(c.toFixed(2)),
-            friction_base: Number(phi.toFixed(2)),
-            cohesion_effective: Number(c_used.toFixed(2)),
-            friction_effective: Number(phi_used.toFixed(2)),
+            FoS: FoS,
+            cohesion: c.toFixed(2),
+            friction: phi.toFixed(2),
             shear_strength: tau_resisting,
             shear_stress: tau_driving
         }
@@ -287,9 +235,6 @@ app.post('/predict', async (req, res) => {
         res.status(500).json({ error: "Failed" });
     }
 });
-
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`✅ Intelligent Physics Engine running on port ${PORT}`);
 });
-
-
