@@ -3,51 +3,38 @@ const cors = require('cors');
 const axios = require('axios');
 
 const app = express();
-const PORT = process.env.PORT || 5000;
+const PORT = 5000;
 
-app.use(cors());                    // allow all origins for now
-app.use(express.json());           // parse JSON bodies
-app.use(express.urlencoded({ extended: true })); // safety net
-
-// Simple health-check route to test server
-app.get('/', (req, res) => {
-    res.send('✅ Landslide backend is running');
-});
+app.use(cors());
+app.use(express.json());
 
 // --- 1. DATA FETCHING ---
 
 const fetchWeather = async (lat, lon) => {
     try {
+        // Request hourly values and current weather (weathercode)
         const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&hourly=temperature_2m,relativehumidity_2m,precipitation&current_weather=true&timezone=UTC`;
         const response = await axios.get(url);
 
+        // Prefer current weather time if available, otherwise use latest hourly sample
         const hourly = response.data.hourly || {};
         const times = hourly.time || [];
         const lastIdx = Math.max(0, times.length - 1);
 
-        const temp = (hourly.temperature_2m && hourly.temperature_2m[lastIdx] !== undefined)
-            ? hourly.temperature_2m[lastIdx]
-            : (response.data.current_weather?.temperature ?? 25);
-
-        const humidity = (hourly.relativehumidity_2m && hourly.relativehumidity_2m[lastIdx] !== undefined)
-            ? hourly.relativehumidity_2m[lastIdx]
-            : 50;
-
-        const precip = (hourly.precipitation && hourly.precipitation[lastIdx] !== undefined)
-            ? hourly.precipitation[lastIdx]
-            : 0;
-
+        const temp = (hourly.temperature_2m && hourly.temperature_2m[lastIdx] !== undefined) ? hourly.temperature_2m[lastIdx] : (response.data.current_weather?.temperature ?? 25);
+        const humidity = (hourly.relativehumidity_2m && hourly.relativehumidity_2m[lastIdx] !== undefined) ? hourly.relativehumidity_2m[lastIdx] : 50;
+        const precip = (hourly.precipitation && hourly.precipitation[lastIdx] !== undefined) ? hourly.precipitation[lastIdx] : 0;
         const code = response.data.current_weather?.weathercode ?? 0;
 
         return {
             temp,
             humidity,
-            rain: precip * 10,
+            rain: precip * 10, // scaled for physics engine
             precip_real: precip,
             code
         };
     } catch (e) {
-        console.error("Weather API Error:", e.message);
+        console.error("Weather API Error", e.message);
         return { temp: 25, humidity: 50, rain: 0, precip_real: 0, code: 0 };
     }
 };
@@ -59,10 +46,12 @@ const fetchSoil = async (lat, lon) => {
 
         const props = response.data?.properties;
 
+        // Default fallback
         if (!props) {
             return { bulk_density: 130, clay: 33, sand: 33, silt: 34, isWater: false };
         }
 
+        // SoilGrids v2: properties.layers may exist; if not, try to extract safely
         const layers = props.layers || [];
         const getValFromLayers = (name) => {
             const layer = layers.find(l => l.name === name);
@@ -74,14 +63,17 @@ const fetchSoil = async (lat, lon) => {
         let sand = getValFromLayers('sand');
         let bulk_density = getValFromLayers('bdod');
 
+        // If layers are empty, attempt to read common alternative shapes
         if (!clay && props.clay && props.clay.values) clay = props.clay.values.mean || clay;
         if (!sand && props.sand && props.sand.values) sand = props.sand.values.mean || sand;
         if (!bulk_density && props.bdod && props.bdod.values) bulk_density = props.bdod.values.mean || bulk_density;
 
+        // If SoilGrids returns null/zeros, consider it water/rock
         if (!clay && !sand && !bulk_density) {
             return { bulk_density: 0, clay: 0, sand: 0, silt: 0, isWater: true };
         }
 
+        // Convert to percent-like units (some layers are given in tenths)
         clay = clay / 10;
         sand = sand / 10;
         let silt = 100 - clay - sand;
@@ -89,7 +81,8 @@ const fetchSoil = async (lat, lon) => {
 
         return { bulk_density, clay, sand, silt, isWater: false };
     } catch (e) {
-        console.error("Soil API Error:", e.message);
+        console.error("Soil API Error", e.message);
+        // If API fails completely, assume standard soil but mark uncertain
         return { bulk_density: 130, clay: 33, sand: 33, silt: 34, isWater: false };
     }
 };
@@ -97,6 +90,7 @@ const fetchSoil = async (lat, lon) => {
 const calculateSlope = async (lat, lon) => {
     try {
         const offset = 0.002;
+        // Request elevation for center, north, and east points (three pairs)
         const url = `https://api.open-meteo.com/v1/elevation?latitude=${lat},${lat + offset},${lat}&longitude=${lon},${lon},${lon + offset}`;
         const response = await axios.get(url);
         const elevations = response.data?.elevation || [];
@@ -105,7 +99,8 @@ const calculateSlope = async (lat, lon) => {
         const hNorth = elevations[1] ?? h0;
         const hEast = elevations[2] ?? h0;
 
-        const dist = 220;
+        // Calculate slope using distances approximated for small offsets
+        const dist = 220; // approximate meters for offset
         const dz_dx = (hEast - h0) / dist;
         const dz_dy = (hNorth - h0) / dist;
         const rise = Math.sqrt(dz_dx * dz_dx + dz_dy * dz_dy);
@@ -113,7 +108,7 @@ const calculateSlope = async (lat, lon) => {
 
         return { elevation: h0, slope: parseFloat(slopeDeg.toFixed(1)) };
     } catch (e) {
-        console.error("Elevation API Error:", e.message);
+        console.error("Elevation API Error", e.message);
         return { elevation: 0, slope: 0 };
     }
 };
@@ -123,106 +118,116 @@ const calculateSlope = async (lat, lon) => {
 const calculateLandslideRisk = (features) => {
     const { rain, slope, clay, sand, silt, bulk_density, elevation, temp, code, isWater } = features;
 
+    // --- STEP 1: ENVIRONMENT DETECTION ---
+
+    // A. Sea / Water Body Check
+    // Water if:
+    //  - Soil API says water (isWater)
+    //  - OR elevation near sea level AND almost flat AND very low bulk_density (no soil)
     const isSeaOrWater = isWater || (
-        elevation >= -5 && elevation <= 5 &&
-        Math.abs(slope) < 0.5 &&
-        bulk_density < 20
+        elevation >= -5 && elevation <= 5 &&  // near sea level
+        Math.abs(slope) < 0.5 &&             // basically flat
+        bulk_density < 20                    // almost no soil mass
     );
 
     if (isSeaOrWater) {
         return {
             level: "Safe",
             reason: "🌊 Water body / Sea detected (flat terrain at sea level). This is not a typical land slope.",
-            details: {
-                FoS: 100,
-                cohesion_base: 0,
-                friction_base: 0,
-                cohesion_effective: 0,
-                friction_effective: 0,
-                shear_strength: 0,
-                shear_stress: 0
-            }
+            details: { FoS: 100, cohesion_base: 0, friction_base: 0, cohesion_effective: 0, friction_effective: 0, shear_strength: 0, shear_stress: 0 }
         };
     }
 
+    // B. Snow / Ice Check
+    // WMO Codes: 71, 73, 75 (Snow), 77 (Grain), 85, 86 (Snow Showers)
     const isSnow = [71, 73, 75, 77, 85, 86].includes(code) || temp < -1;
     if (isSnow) {
         return {
             level: slope > 30 ? "High" : "Medium",
             reason: "❄️ Ice/Snow detected. Risk is predominantly from Avalanche or Thaw-Slump, not typical soil shear.",
-            details: {
-                FoS: slope > 30 ? 0.9 : 1.5,
-                cohesion_base: 50,
-                friction_base: 10,
-                cohesion_effective: 50,
-                friction_effective: 10,
-                shear_strength: 0,
-                shear_stress: 0
-            }
+            details: { FoS: slope > 30 ? 0.9 : 1.5, cohesion_base: 50, friction_base: 10, cohesion_effective: 50, friction_effective: 10, shear_strength: 0, shear_stress: 0 }
         };
     }
+
+    // --- STEP 2: SOIL PHYSICS CALCULATION ---
 
     const fClay = clay / 100;
     const fSand = sand / 100;
     const fSilt = silt / 100;
 
-    let c = (fClay * 35) + (fSilt * 10) + (fSand * 1);
-    let phi = (fSand * 34) + (fSilt * 28) + (fClay * 18);
+    // Base soil parameters (material constants)
+    let c = (fClay * 35) + (fSilt * 10) + (fSand * 1);      // ~kPa
+    let phi = (fSand * 34) + (fSilt * 28) + (fClay * 18);   // degrees
 
-    let saturationIndex = 0.1;
+    // --- Saturation / Rain effect on geotech parameters ---
+    // saturationIndex ≈ 0 (dry) → 1 (very wet)
+    let saturationIndex = 0.1; // some natural moisture even if rain low
     if (rain > 800) saturationIndex = 1.0;
     else if (rain > 400) saturationIndex = 0.7;
     else if (rain > 100) saturationIndex = 0.4;
 
-    const c_eff = c * (1 - 0.5 * saturationIndex);
-    const phi_eff = phi * (1 - 0.3 * saturationIndex);
+    // Reduce cohesion and friction angle when saturated
+    const c_eff = c * (1 - 0.5 * saturationIndex);         // up to 50% loss in cohesion
+    const phi_eff = phi * (1 - 0.3 * saturationIndex);     // up to 30% loss in friction
 
+    // Prevent negative values
     const c_used = Math.max(0, c_eff);
-    const phi_used = Math.max(5, phi_eff);
+    const phi_used = Math.max(5, phi_eff); // keep at least minimal friction
 
-    const gamma = (bulk_density / 100) * 9.81;
-    const z = 3.0;
-    const beta = slope * (Math.PI / 180);
+    // Unit weight (simplified) and normal/shear stresses
+    const gamma = (bulk_density / 100) * 9.81;  // pseudo kN/m³
+    const z = 3.0;                              // failure plane depth (m)
+    const beta = slope * (Math.PI / 180);       // slope angle (rad)
 
-    const sigma = gamma * z * Math.pow(Math.cos(beta), 2);
-    const tau_driving = gamma * z * Math.sin(beta) * Math.cos(beta);
+    const sigma = gamma * z * Math.pow(Math.cos(beta), 2); 
+    const tau_driving = gamma * z * Math.sin(beta) * Math.cos(beta); 
 
+    // Rain Saturation Logic (pore pressure)
     let u = 0;
-    if (rain > 800) u = sigma * 0.5;
-    else if (rain > 400) u = sigma * 0.3;
-    else if (rain > 100) u = sigma * 0.1;
+    if (rain > 800) u = sigma * 0.5; 
+    else if (rain > 400) u = sigma * 0.3; 
+    else if (rain > 100) u = sigma * 0.1; 
 
     const sigma_effective = Math.max(0, sigma - u);
     const tanPhi = Math.tan(phi_used * (Math.PI / 180));
 
+    // Use effective cohesion & friction
     const tau_resisting = c_used + (sigma_effective * tanPhi);
+
     let FoS = tau_resisting / (tau_driving + 0.001);
 
+    // --- STEP 3: RISK MAPPING ---
+    
     let probability = 0;
-    if (slope < 1) {
+    if (slope < 1) { 
         FoS = 20.0;
         probability = 0.01;
     } else {
-        if (FoS < 1.0) probability = 0.95;
-        else if (FoS < 1.2) probability = 0.75;
-        else if (FoS < 1.5) probability = 0.40;
-        else if (FoS < 2.0) probability = 0.20;
-        else probability = 0.05;
+        if (FoS < 1.0) probability = 0.95; 
+        else if (FoS < 1.2) probability = 0.75; 
+        else if (FoS < 1.5) probability = 0.40; 
+        else if (FoS < 2.0) probability = 0.20; 
+        else probability = 0.05; 
     }
 
     let level = "Low";
     if (probability > 0.7) level = "High";
     else if (probability > 0.3) level = "Medium";
 
+    // --- STEP 4: NATURAL LANGUAGE GENERATOR ---
+
     let sentences = [];
 
+    // Soil Description
     if (fClay > 0.45) sentences.push(`The terrain is Clay-rich (${clay.toFixed(0)}%), which is cohesive but slippery when wet.`);
     else if (fSand > 0.6) sentences.push(`The terrain is Sandy (${sand.toFixed(0)}%), which is loose and prone to washout.`);
     else sentences.push(`The soil has a balanced mix of sand, silt, and clay, providing moderate stability.`);
 
+    // Slope Description
     if (slope > 35) sentences.push(`The slope is extremely steep (${slope}°), making it naturally unstable.`);
     else if (slope < 5) sentences.push(`The land is flat (${slope}°), significantly reducing landslide risk.`);
 
+    // Weather Impact
     if (rain > 400) sentences.push(`⚠️ CRITICAL: Heavy rainfall is saturating the ground, reducing cohesion and friction.`);
     else if (rain > 100) sentences.push(`Moderate rain detected. Pore pressure is increasing and effective strength is reduced.`);
 
@@ -246,16 +251,8 @@ const calculateLandslideRisk = (features) => {
 // --- 3. ROUTE ---
 
 app.post('/predict', async (req, res) => {
-    console.log('🔵 /predict hit, body =', req.body);
-
-    const { lat, lng, manualRain } = req.body;
-
-    if (lat === undefined || lng === undefined) {
-        console.warn('⚠️ Missing lat/lng in body');
-        return res.status(400).json({ error: 'lat and lng are required' });
-    }
-
-    console.log(`📍 Analysis: ${lat}, ${lng} | Rain Override: ${manualRain ?? 'None'}`);
+    const { lat, lng, manualRain } = req.body; 
+    console.log(`\n📍 Analysis: ${lat}, ${lng} | Rain Override: ${manualRain ?? 'None'}`);
 
     try {
         const [weather, soil, topo] = await Promise.all([
@@ -267,9 +264,10 @@ app.post('/predict', async (req, res) => {
         let features = { ...weather, ...soil, ...topo };
         let isSimulated = false;
 
+        // Apply Rain Override (for slider)
         if (manualRain !== null && manualRain !== undefined) {
             features.precip_real = manualRain;
-            features.rain = manualRain * 10;
+            features.rain = manualRain * 10; 
             isSimulated = true;
         }
 
@@ -285,7 +283,7 @@ app.post('/predict', async (req, res) => {
         });
 
     } catch (error) {
-        console.error('❌ /predict error:', error);
+        console.error(error);
         res.status(500).json({ error: "Failed" });
     }
 });
