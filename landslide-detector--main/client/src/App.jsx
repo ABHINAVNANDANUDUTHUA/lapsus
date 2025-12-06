@@ -41,10 +41,11 @@ function App() {
 
     const predictRisk = async (latlng, manualRainOverride = null) => {
         setLoading(true);
-        try {
+            try {
             const rainToSend = (simMode && manualRainOverride !== null) ? manualRainOverride : (simMode ? rainValue : null);
 
-            const response = await axios.post('https://lapsus-xcab.vercel.app/predict', {
+            // Send to local Node.js server by default (run server with `node server/index.js`)
+            const response = await axios.post('https://lapsus-vzwm.vercel.app//predict', {
                 lat: latlng.lat,
                 lng: latlng.lng,
                 manualRain: rainToSend
@@ -52,7 +53,7 @@ function App() {
             setResult(response.data);
         } catch (error) {
             console.error("Prediction Error:", error); // Log the error
-            alert("Server Error. Make sure Node.js is running!");
+            alert("Server Error. Make sure the backend (server) is running on https://lapsus-vzwm.vercel.app/");
             setResult(null); // Clear result on error to avoid displaying bad data
         } finally {
             setLoading(false);
