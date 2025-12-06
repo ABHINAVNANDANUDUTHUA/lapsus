@@ -45,7 +45,7 @@ function App() {
             const rainToSend = (simMode && manualRainOverride !== null) ? manualRainOverride : (simMode ? rainValue : null);
 
             // Send to local Node.js server by default (run server with `node server/index.js`)
-            const response = await axios.post('https://lapsus-vzwm.vercel.app//predict', {
+            const response = await axios.post('https://lapsus-vzwm.vercel.app/predict', {
                 lat: latlng.lat,
                 lng: latlng.lng,
                 manualRain: rainToSend
