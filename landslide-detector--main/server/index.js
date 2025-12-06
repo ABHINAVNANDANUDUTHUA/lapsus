@@ -170,7 +170,7 @@ const calculateLandslideRisk = (features) => {
     // Soil Description
     if (fClay > 0.45) sentences.push(`The terrain is Clay-rich (${clay.toFixed(0)}%), which is cohesive but slippery when wet.`);
     else if (fSand > 0.6) sentences.push(`The terrain is Sandy (${sand.toFixed(0)}%), which is loose and prone to washout.`);
-    else sentences.push(`The soil is a Loam mixture (Sand/Silt/Clay), providing moderate stability.`);
+    else sentences.push(`Providing moderate stability.`);
 
     // Slope Description
     if (slope > 35) sentences.push(`The slope is extremely steep (${slope}°), making it naturally unstable.`);
