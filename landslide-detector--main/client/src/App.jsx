@@ -47,7 +47,7 @@ function App() {
             // Determine if we are sending manual rain or null (for live weather)
             const rainToSend = (simMode && manualRainOverride !== null) ? manualRainOverride : (simMode ? rainValue : null);
 
-            const response = await axios.post('https://lapsus-xcab.vercel.app/predict', {
+            const response = await axios.post('https://landslide-detector-backend.vercel.app/predict', {
                 lat: latlng.lat,
                 lng: latlng.lng,
                 manualRain: rainToSend // Send the slider value to backend
