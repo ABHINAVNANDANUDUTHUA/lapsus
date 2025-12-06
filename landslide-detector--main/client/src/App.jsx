@@ -66,16 +66,8 @@ function App() {
     const safeData = (key, suffix = '', fallback = 'N/A') => 
         (result?.data?.[key] !== undefined && result.data[key] !== null) ? `${result.data[key]}${suffix}` : fallback;
     // Helper function to safely access prediction detail properties
-        const safeDetail = (key, suffix = '', fallback = 'N/A') => {
-            const details = result?.prediction?.details;
-            if (!details) return fallback;
-            const val = (details[key] !== undefined && details[key] !== null)
-                ? details[key]
-                : (details[`${key}_effective`] !== undefined && details[`${key}_effective`] !== null)
-                    ? details[`${key}_effective`]
-                    : null;
-            return val !== null ? `${val}${suffix}` : fallback;
-        };
+    const safeDetail = (key, suffix = '', fallback = 'N/A') => 
+        (result?.prediction?.details?.[key] !== undefined && result.prediction.details[key] !== null) ? `${result.prediction.details[key]}${suffix}` : fallback;
 
 
     return (
