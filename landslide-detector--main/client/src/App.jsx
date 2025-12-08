@@ -13,7 +13,7 @@ function MapClickHandler({ setMarker, predictRisk }) {
     useMapEvents({
         click(e) {
             setMarker(e.latlng);
-            predictRisk(e.latlng); // Pass location, use current slider state inside parent
+            predictRisk(e.latlng);
         },
     });
     return null;
@@ -41,24 +41,46 @@ function App() {
 
     const predictRisk = async (latlng, manualRainOverride = null) => {
         setLoading(true);
-        // Keep previous result visible while loading new simulation
-        // setResult(null); 
-        try {
-            // Determine if we are sending manual rain or null (for live weather)
+            try {
             const rainToSend = (simMode && manualRainOverride !== null) ? manualRainOverride : (simMode ? rainValue : null);
 
+<<<<<<< HEAD
             const response = await axios.post('https://lapsus-vzwm.vercel.app/predict', {
+=======
+            // Send to local Node.js server by default (run server with `node server/index.js`)
+            const response = await axios.post('https://lapsus-vzwm.vercel.app//predict', {
+>>>>>>> 5212631 (Upload landslide detector project)
                 lat: latlng.lat,
                 lng: latlng.lng,
-                manualRain: rainToSend // Send the slider value to backend
+                manualRain: rainToSend
             });
             setResult(response.data);
         } catch (error) {
-            alert("Server Error. Make sure Node.js is running!");
+            console.error("Prediction Error:", error); // Log the error
+            alert("Server Error. Make sure the backend (server) is running on https://lapsus-vzwm.vercel.app/");
+            setResult(null); // Clear result on error to avoid displaying bad data
         } finally {
             setLoading(false);
         }
     };
+
+    // Helper to safely format FoS, falling back to 'N/A'
+    const safeFoS = result?.prediction?.details?.FoS?.toFixed(2) ?? 'N/A';
+    // Helper function to safely access data properties
+    const safeData = (key, suffix = '', fallback = 'N/A') => 
+        (result?.data?.[key] !== undefined && result.data[key] !== null) ? `${result.data[key]}${suffix}` : fallback;
+    // Helper function to safely access prediction detail properties
+        const safeDetail = (key, suffix = '', fallback = 'N/A') => {
+            const details = result?.prediction?.details;
+            if (!details) return fallback;
+            const val = (details[key] !== undefined && details[key] !== null)
+                ? details[key]
+                : (details[`${key}_effective`] !== undefined && details[`${key}_effective`] !== null)
+                    ? details[`${key}_effective`]
+                    : null;
+            return val !== null ? `${val}${suffix}` : fallback;
+        };
+
 
     return (
         <div className="relative h-screen w-screen bg-slate-900 font-sans text-slate-800">
@@ -127,7 +149,8 @@ function App() {
                             </div>
                             <div className="text-right">
                                 <p className="text-xs opacity-80">Safety Factor</p>
-                                <p className="text-2xl font-mono">{result.prediction.details.FoS.toFixed(2)}</p>
+                                {/* FIXED: Safe access to FoS */}
+                                <p className="text-2xl font-mono">{safeFoS}</p>
                             </div>
                         </div>
 
@@ -146,12 +169,14 @@ function App() {
                                     {result.isSimulated ? "Simulated Weather" : "Live Weather Conditions"}
                                 </h3>
                                 <div className="grid grid-cols-3 gap-2">
-                                    <StatBox label="Temp" value={`${result.data.temp}°C`} />
-                                    <StatBox label="Humidity" value={`${result.data.humidity}%`} />
+                                    {/* FIXED: Safe access to data properties */}
+                                    <StatBox label="Temp" value={safeData('temp', '°C')} />
+                                    <StatBox label="Humidity" value={safeData('humidity', '%')} />
+                                    
                                     {/* Highlight Rain Box if Simulated */}
                                     <div className={`p-2 rounded border ${result.isSimulated ? 'bg-cyan-50 border-cyan-200' : 'bg-slate-50 border-slate-200'}`}>
                                         <p className={`text-[10px] uppercase tracking-wide ${result.isSimulated ? 'text-cyan-600' : 'text-slate-400'}`}>Rainfall</p>
-                                        <p className={`text-lg font-bold ${result.isSimulated ? 'text-cyan-700' : 'text-slate-700'}`}>{result.data.precip_real} mm</p>
+                                        <p className={`text-lg font-bold ${result.isSimulated ? 'text-cyan-700' : 'text-slate-700'}`}>{safeData('precip_real', ' mm')}</p>
                                     </div>
                                 </div>
                             </div>
@@ -160,8 +185,10 @@ function App() {
                             <div>
                                 <h3 className="text-xs font-bold text-slate-400 uppercase mb-2">Terrain Analysis</h3>
                                 <div className="grid grid-cols-2 gap-2">
-                                    <StatBox label="Slope Angle" value={`${result.data.slope}°`} />
-                                    <StatBox label="Elevation" value={`${Math.round(result.data.elevation)}m`} />
+                                    {/* FIXED: Safe access to data properties */}
+                                    <StatBox label="Slope Angle" value={safeData('slope', '°')} />
+                                    {/* Special handling for rounding elevation */}
+                                    <StatBox label="Elevation" value={result.data?.elevation ? `${Math.round(result.data.elevation)}m` : 'N/A'} />
                                 </div>
                             </div>
 
@@ -169,8 +196,10 @@ function App() {
                             <div>
                                 <h3 className="text-xs font-bold text-slate-400 uppercase mb-2">Geotech Physics</h3>
                                 <div className="grid grid-cols-2 gap-2">
-                                    <StatBox label="Cohesion (c)" value={`${result.prediction.details.cohesion} kPa`} />
-                                    <StatBox label="Friction (φ)" value={`${result.prediction.details.friction}°`} />
+                                    {/* FIX APPLIED HERE: Safe access to cohesion */}
+                                    <StatBox label="Cohesion (c)" value={safeDetail('cohesion', ' kPa')} />
+                                    {/* FIX APPLIED HERE: Safe access to friction */}
+                                    <StatBox label="Friction (φ)" value={safeDetail('friction', '°')} />
                                 </div>
                             </div>
                         </div>
