@@ -44,12 +44,8 @@ function App() {
             try {
             const rainToSend = (simMode && manualRainOverride !== null) ? manualRainOverride : (simMode ? rainValue : null);
 
-<<<<<<< HEAD
+            // Using the production URL
             const response = await axios.post('https://lapsus-vzwm.vercel.app/predict', {
-=======
-            // Send to local Node.js server by default (run server with `node server/index.js`)
-            const response = await axios.post('https://lapsus-vzwm.vercel.app//predict', {
->>>>>>> 5212631 (Upload landslide detector project)
                 lat: latlng.lat,
                 lng: latlng.lng,
                 manualRain: rainToSend
