@@ -298,7 +298,7 @@ function App() {
                             
                             <div className="bg-gradient-to-br from-slate-50 to-slate-100 p-4 rounded-lg border-l-4 border-cyan-500">
                                 <p className="text-[10px] text-slate-500 uppercase font-bold mb-2 flex items-center gap-1">
-                                    <span>🧠</span> AI Analysis
+                                    <span>🧠</span> Analysis
                                 </p>
                                 <p className="text-sm font-medium text-slate-700 leading-relaxed">{result.prediction.reason}</p>
                             </div>
