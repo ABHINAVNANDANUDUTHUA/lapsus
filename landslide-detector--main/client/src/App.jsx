@@ -1,411 +1,728 @@
-import React, { useState, useEffect } from 'react';
-import { MapContainer, TileLayer, Marker, useMapEvents } from 'react-leaflet';
-import 'leaflet/dist/leaflet.css';
-import axios from 'axios';
-import L from 'leaflet';
-import icon from 'leaflet/dist/images/marker-icon.png';
-import iconShadow from 'leaflet/dist/images/marker-shadow.png';
+const express = require("express");
+const cors = require("cors");
+const axios = require("axios");
+const {
+  initSoils,
+  getSoilProperties,
+  detectSoilType,
+} = require("./soilRaster");
 
-let DefaultIcon = L.icon({ iconUrl: icon, shadowUrl: iconShadow, iconAnchor: [12, 41] });
-L.Marker.prototype.options.icon = DefaultIcon;
+const app = express();
 
-function MapClickHandler({ setMarker, predictRisk }) {
-    useMapEvents({
-        click(e) {
-            setMarker(e.latlng);
-            predictRisk(e.latlng);
-        },
-    });
-    return null;
+// Initialize soil rasters in background (non-blocking)
+// App continues to work even if this fails
+if (process.env.NODE_ENV !== "test") {
+  initSoils().catch((err) => {
+    console.warn("⚠️ Soil initialization failed, using defaults:", err.message);
+  });
 }
 
-function App() {
-    const [marker, setMarker] = useState(null);
-    const [loading, setLoading] = useState(false);
-    const [result, setResult] = useState(null);
-    const [simMode, setSimMode] = useState(false);
-    const [rainValue, setRainValue] = useState(0);
-    const [searchQuery, setSearchQuery] = useState('');
-    const [depth, setDepth] = useState(2.5); // failure depth in meters
+// ===== CORS CONFIGURATION =====
+// Allow all origins for Vercel
+app.use(
+  cors({
+    origin: true,
+    methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    allowedHeaders: [
+      "Content-Type",
+      "Authorization",
+      "Accept",
+      "X-Requested-With",
+    ],
+    credentials: true,
+    maxAge: 86400,
+    optionsSuccessStatus: 200,
+  }),
+);
 
-    const getFrictionDisplay = (res) => {
-        if (!res || !res.prediction || !res.prediction.details) return '—';
-        const details = res.prediction.details;
-        const val = details.friction_angle ?? details.friction ?? null;
-        return val !== null && val !== undefined ? `${val}°` : '—';
-    };
+// Explicit OPTIONS handler for preflight
+app.use(cors());
 
-    const getRainDisplay = (res) => {
-        if (!res || !res.data) return '—';
-        const d = res.data;
-        const val = (d.rain_current ?? d.precip_real ?? d.rain) ?? null;
-        return val !== null && val !== undefined ? `${parseFloat(val).toFixed(1)} mm` : '—';
-    };
+// Middleware
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ limit: "10mb", extended: true }));
 
-    // Re-run when rain slider moves in sim mode
-    useEffect(() => {
-        if (marker && simMode) {
-            const timer = setTimeout(() => {
-                predictRisk(marker, rainValue);
-            }, 500);
-            return () => clearTimeout(timer);
-        }
-    }, [rainValue, simMode]);
+// ===== HEALTH CHECK - RESPONDS IMMEDIATELY =====
+app.get("/health", (req, res) => {
+  res.json({
+    status: "operational",
+    version: "2.0",
+    timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV || "unknown",
+  });
+});
 
-    // Re-run when depth changes (if there's already a selected location)
-    useEffect(() => {
-        if (marker) {
-            const timer = setTimeout(() => {
-                predictRisk(marker);
-            }, 400);
-            return () => clearTimeout(timer);
-        }
-    }, [depth]);
+app.get("/", (req, res) => {
+  res.json({
+    message: "Landslide Detector Backend API",
+    status: "running",
+    version: "2.0",
+    endpoints: {
+      health: "/health",
+      predict: "/predict",
+      corsTest: "/cors-test",
+    },
+    environment: process.env.NODE_ENV || "unknown",
+  });
+});
 
-    const predictRisk = async (latlng, manualRainOverride = null) => {
-        setLoading(true);
-        try {
-            const rainToSend = (simMode && manualRainOverride !== null) ? manualRainOverride : (simMode ? rainValue : null);
+// CORS test endpoint
+app.get("/cors-test", (req, res) => {
+  res.json({
+    message: "CORS is working!",
+    origin: req.get("origin") || "no-origin",
+    timestamp: new Date().toISOString(),
+  });
+});
 
-            const response = await axios.post('https://lapsus-vzwm.vercel.app/predict', {
-                lat: latlng.lat,
-                lng: latlng.lng,
-                manualRain: rainToSend,
-                depth: Number(depth) || 2.5
-            });
-            setResult(response.data);
-        } catch (error) {
-            console.error(error);
-            alert("Server Error. Make sure the backend is running!");
-        } finally {
-            setLoading(false);
-        }
-    };
+// ===== DEBUG MIDDLEWARE =====
+app.use((req, res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
+  if (req.method === "OPTIONS") {
+    console.log("  ↳ Preflight request detected");
+  }
+  next();
+});
 
-    // Manual location search using Nominatim
-    const handleLocationSearch = async () => {
-        const q = searchQuery.trim();
-        if (!q) return;
-        try {
-            setLoading(true);
-            const res = await axios.get('https://nominatim.openstreetmap.org/search', {
-                params: {
-                    q,
-                    format: 'json',
-                    limit: 1
-                },
-                headers: {
-                    // Nominatim wants some identification; from browser this is best effort
-                    'Accept-Language': 'en'
-                }
-            });
+// --- 1. ENHANCED DATA FETCHING ---
 
-            if (!res.data || res.data.length === 0) {
-                alert("Location not found. Try a more specific name.");
-                return;
-            }
+const fetchWeather = async (lat, lon) => {
+  try {
+    // Fetch current + 7-day forecast for rainfall history
+    const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m,precipitation,weather_code,wind_speed_10m&daily=precipitation_sum,temperature_2m_max,temperature_2m_min&past_days=7&forecast_days=1`;
+    const response = await axios.get(url);
+    const current = response.data.current;
+    const daily = response.data.daily;
 
-            const loc = res.data[0];
-            const lat = parseFloat(loc.lat);
-            const lng = parseFloat(loc.lon);
+    // Calculate 7-day cumulative rainfall
+    const rainfall_7day = daily.precipitation_sum
+      .slice(0, 7)
+      .reduce((a, b) => a + (b || 0), 0);
 
-            const latlng = { lat, lng };
-            setMarker(latlng);
-            predictRisk(latlng);
-        } catch (err) {
-            console.error(err);
-            alert("Location search failed.");
-        } finally {
-            setLoading(false);
-        }
-    };
+    return {
+      temp: current.temperature_2m,
+      temp_max: daily.temperature_2m_max[0],
+      temp_min: daily.temperature_2m_min[0],
+      humidity: current.relative_humidity_2m,
+      rain_current: current.precipitation,
+      rain_7day: rainfall_7day,
+      wind_speed: current.wind_speed_10m,
+      code: current.weather_code,
+    };
+  } catch (e) {
+    console.error("⚠️ Weather API Error:", e.message);
+    return {
+      temp: 15,
+      temp_max: 20,
+      temp_min: 10,
+      humidity: 50,
+      rain_current: 0,
+      rain_7day: 0,
+      wind_speed: 0,
+      code: 0,
+    };
+  }
+};
 
-        const handleUseMyLocation = () => {
-        if (!navigator.geolocation) {
-            alert("Geolocation is not supported in this browser.");
-            return;
-        }
+const fetchSoil = async (lat, lon, depth = 2.5) => {
+  try {
+    // Use GeoTIFF raster-based soil properties
+    const soilProps = getSoilProperties(lat, lon, depth);
 
-        navigator.geolocation.getCurrentPosition(
-            (pos) => {
-                const lat = pos.coords.latitude;
-                const lng = pos.coords.longitude;
-                const latlng = { lat, lng };
-                setMarker(latlng);
-                predictRisk(latlng);
-            },
-            (err) => {
-                console.error(err);
-                alert("Failed to get location. Make sure location permission is allowed.");
-            },
-            {
-                enableHighAccuracy: true,
-                timeout: 10000,
-                maximumAge: 60000,
-            }
-        );
-    };
+    return {
+      bulk_density: (soilProps.gamma / 9.81) * 100,
+      clay: soilProps.clay,
+      sand: soilProps.sand,
+      silt: soilProps.silt,
+      ph: 7.0,
+      organic_carbon: 1.5,
+      isWater: false,
+      raw: true,
+      soilType: soilProps.soilType,
+      cohesion: soilProps.c,
+      friction_angle: soilProps.phi,
+      permeability: soilProps.permeability,
+    };
+  } catch (e) {
+    console.error("⚠️ GeoTIFF Raster Read Error (Using fallback):", e.message);
 
+    // Fallback to location-based defaults
+    const absLat = Math.abs(lat);
+    const noise = Math.abs(lat * lon) % 13;
 
-    const getEnvironmentIcon = (env) => {
-        const icons = {
-            "Water Body": "🌊",
-            "River/Stream": "🏞️",
-            "Polar/Glacier": "❄️",
-            "Snow-Covered": "⛷️",
-            "Desert": "🏜️",
-            "Rock Outcrop": "⛰️",
-            "Land Surface": "🏔️"
-        };
-        return icons[env] || "📍";
-    };
+    let clay, sand, silt;
+    if (absLat > 60) {
+      clay = 15 + noise;
+      sand = 55 + noise;
+      silt = 30 - noise;
+    } else if (absLat < 23) {
+      clay = 40 + noise;
+      sand = 25 + noise;
+      silt = 35 - noise;
+    } else {
+      clay = 30 + noise;
+      sand = 35 + noise;
+      silt = 35 - noise;
+    }
 
-    return (
-        <div className="relative h-screen w-screen bg-slate-900 font-sans text-slate-800">
-            
-            <div className="absolute top-4 left-4 z-[1000] w-80 md:w-96 flex flex-col gap-4 max-h-[calc(100vh-2rem)] overflow-y-auto">
-                
-                <div className="bg-white/95 backdrop-blur-md p-5 rounded-2xl shadow-xl border-l-8 border-cyan-500">
-                    <h1 className="text-2xl font-extrabold text-slate-800">LAP <span className="text-cyan-500">SUS</span></h1>
-                    <p className="text-xs text-slate-500 mt-1">Real-time Landslide Analysis System</p>
-                </div>
+    return {
+      bulk_density: 140 + noise,
+      clay,
+      sand,
+      silt,
+      ph: 6.5,
+      organic_carbon: 2,
+      isWater: false,
+      raw: false,
+      soilType: "loamy",
+      cohesion: 20,
+      friction_angle: 28,
+      permeability: 5.0,
+    };
+  }
+};
 
-                {/* Manual location search + depth input */}
-                                {/* Manual location search + depth input */}
-                <div className="bg-white/95 backdrop-blur-md p-4 rounded-xl shadow-lg space-y-3">
-                    <div className="space-y-1.5">
-                        <p className="text-xs font-bold uppercase text-slate-500">Location</p>
+const calculateSlope = async (lat, lon) => {
+  try {
+    const offset = 0.003;
+    const url = `https://api.open-meteo.com/v1/elevation?latitude=${lat},${lat + offset},${lat - offset},${lat}&longitude=${lon},${lon},${lon},${lon + offset}`;
+    const response = await axios.get(url);
+    const elevations = response.data.elevation;
 
-                        {/* Search bar */}
-                        <div className="flex gap-2">
-                            <input
-                                type="text"
-                                value={searchQuery}
-                                onChange={(e) => setSearchQuery(e.target.value)}
-                                placeholder="Search place (eg. Munnar, Kerala)"
-                                className="flex-1 px-2 py-1.5 text-xs border rounded-lg border-slate-300 focus:outline-none focus:ring-1 focus:ring-cyan-500"
-                            />
-                            <button
-                                onClick={handleLocationSearch}
-                                className="px-3 py-1.5 text-xs font-semibold rounded-lg bg-cyan-600 text-white hover:bg-cyan-700"
-                            >
-                                Go
-                            </button>
-                        </div>
+    const h0 = elevations[0];
+    const hNorth = elevations[1];
+    const hSouth = elevations[2];
+    const hEast = elevations[3];
 
-                        {/* Auto location button */}
-                        <button
-                            onClick={handleUseMyLocation}
-                            className="w-full mt-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg border border-emerald-500 text-emerald-700 hover:bg-emerald-50 flex items-center justify-center gap-1"
-                        >
-                            <span>Use My Current Location</span>
-                        </button>
-                    </div>
+    // Ocean detection baseline
+    if (h0 === 0 && hNorth === 0 && hEast === 0) {
+      return { elevation: 0, slope: 0, aspect: 0 };
+    }
 
+    const dist = 333; // ~333m for 0.003 degrees
+    const dz_dx = (hEast - h0) / dist;
+    const dz_dy = (hNorth - hSouth) / (2 * dist);
+    const rise = Math.sqrt(dz_dx * dz_dx + dz_dy * dz_dy);
+    const slopeDeg = Math.atan(rise) * (180 / Math.PI);
 
-                    <div>
-                        <div className="flex justify-between items-center mb-1">
-                            <span className="text-xs font-bold uppercase text-slate-500">Failure Depth</span>
-                            <span className="text-[11px] text-slate-600">{depth} m</span>
-                        </div>
-                        <div className="flex items-center gap-2">
-                            <input
-                                type="range"
-                                min="0.5"
-                                max="15"
-                                step="0.5"
-                                value={depth}
-                                onChange={(e) => setDepth(Number(e.target.value))}
-                                className="flex-1 h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-emerald-500"
-                            />
-                            <input
-                                type="number"
-                                min="0.5"
-                                max="15"
-                                step="0.5"
-                                value={depth}
-                                onChange={(e) => setDepth(Number(e.target.value) || 2.5)}
-                                className="w-16 px-2 py-1 text-xs border rounded-lg border-slate-300 focus:outline-none focus:ring-1 focus:ring-emerald-500"
-                            />
-                        </div>
-                        <p className="text-[10px] text-slate-400 mt-1">Approximate depth of potential failure plane.</p>
-                    </div>
-                </div>
+    // Calculate aspect (direction of slope)
+    const aspect = Math.atan2(dz_dx, dz_dy) * (180 / Math.PI);
 
-                <div className="bg-white/95 backdrop-blur-md p-4 rounded-xl shadow-lg">
-                    <div className="flex justify-between items-center mb-3">
-                        <span className="text-xs font-bold uppercase text-slate-500">Simulation Mode</span>
-                        <label className="relative inline-flex items-center cursor-pointer">
-                            <input type="checkbox" checked={simMode} onChange={(e) => setSimMode(e.target.checked)} className="sr-only peer" />
-                            <div className="w-9 h-5 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-cyan-500"></div>
-                        </label>
-                    </div>
+    return {
+      elevation: h0,
+      slope: parseFloat(slopeDeg.toFixed(2)),
+      aspect: parseFloat(aspect.toFixed(0)),
+    };
+  } catch (e) {
+    console.error("⚠️ Elevation API Error:", e.message);
+    return { elevation: 0, slope: 0, aspect: 0 };
+  }
+};
 
-                    {simMode ? (
-                        <div>
-                            <div className="flex justify-between text-xs font-bold text-slate-600 mb-1">
-                                <span>Rainfall Amount</span>
-                                <span className="text-cyan-600">{rainValue} mm</span>
-                            </div>
-                            <input 
-                                type="range" 
-                                min="0" 
-                                max="200" 
-                                step="5"
-                                value={rainValue} 
-                                onChange={(e) => setRainValue(Number(e.target.value))}
-                                className="w-full h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer accent-cyan-500"
-                            />
-                            <p className="text-[10px] text-slate-400 mt-1 text-center">Test extreme weather scenarios</p>
-                        </div>
-                    ) : (
-                        <p className="text-xs text-slate-400 italic">Using Live Weather Data</p>
-                    )}
-                </div>
+// --- 2. CLIMATE CLASSIFICATION ---
 
-                {loading && (
-                    <div className="bg-cyan-600 text-white p-4 rounded-xl shadow-lg animate-pulse flex items-center gap-3">
-                        <div className="w-5 h-5 border-4 border-white border-t-transparent rounded-full animate-spin"></div>
-                        <span className="font-bold text-sm">Analyzing Terrain...</span>
-                    </div>
-                )}
+const getKoppenClimate = (lat, temp, temp_max, temp_min, rain_7day) => {
+  const absLat = Math.abs(lat);
+  const avgTemp = (temp_max + temp_min) / 2;
 
-                {result && (
-                    <div className="bg-white/95 backdrop-blur-md rounded-2xl shadow-2xl overflow-hidden transition-all duration-500">
-                        
-                        <div className={`p-5 text-white flex justify-between items-center ${
-                            result.prediction.level === 'High' ? 'bg-red-600' :
-                            result.prediction.level === 'Medium' ? 'bg-orange-500' : 'bg-green-600'
-                        }`}>
-                            <div>
-                                <p className="text-xs uppercase font-bold opacity-80">Risk Level</p>
-                                <h2 className="text-3xl font-bold">{result.prediction.level}</h2>
-                                <p className="text-xs opacity-90 mt-1">
-                                    {getEnvironmentIcon(result.prediction.environment)} {result.prediction.environment}
-                                </p>
-                            </div>
-                            <div className="text-right">
-                                <p className="text-xs opacity-80">Safety Factor</p>
-                                <p className="text-2xl font-mono">{result.prediction.details.FoS.toFixed(2)}</p>
-                                <p className="text-[10px] opacity-70 mt-1">
-                                    {result.prediction.details.FoS < 1 ? "FAILURE" : 
-                                     result.prediction.details.FoS < 1.5 ? "UNSTABLE" : "STABLE"}
-                                </p>
-                            </div>
-                        </div>
+  // Simplified Köppen classification
+  if (absLat > 66) {
+    return {
+      zone: "Polar (ET/EF)",
+      vegetation: "minimal",
+      permafrost: temp < 0,
+    };
+  } else if (absLat > 60) {
+    return {
+      zone: "Subarctic (Dfc/Dfd)",
+      vegetation: "sparse",
+      permafrost: temp < -5,
+    };
+  } else if (avgTemp < 0) {
+    return { zone: "Cold (Df/Dw)", vegetation: "moderate", permafrost: false };
+  } else if (avgTemp > 18 && rain_7day > 50) {
+    return { zone: "Tropical (Af/Am)", vegetation: "dense", permafrost: false };
+  } else if (avgTemp > 18) {
+    return {
+      zone: "Arid/Semi-arid (BWh/BSh)",
+      vegetation: "sparse",
+      permafrost: false,
+    };
+  } else if (temp_max > 22) {
+    return {
+      zone: "Temperate (Cfa/Cfb)",
+      vegetation: "moderate",
+      permafrost: false,
+    };
+  } else {
+    return {
+      zone: "Continental (Dfa/Dfb)",
+      vegetation: "moderate",
+      permafrost: false,
+    };
+  }
+};
 
-                        <div className="p-5 space-y-4 max-h-[50vh] overflow-y-auto">
-                            
-                            <div className="bg-gradient-to-br from-slate-50 to-slate-100 p-4 rounded-lg border-l-4 border-cyan-500">
-                                <p className="text-[10px] text-slate-500 uppercase font-bold mb-2 flex items-center gap-1">
-                                    <span>🧠</span> Analysis
-                                </p>
-                                <p className="text-sm font-medium text-slate-700 leading-relaxed">{result.prediction.reason}</p>
-                            </div>
+// --- 3. SOIL TEXTURE CLASSIFICATION (USDA) ---
 
-                            {/* FIX: soil_type instead of soilType */}
-                            {result.prediction.soil_type && (
-                                <div className="bg-amber-50 p-3 rounded-lg border border-amber-200">
-                                    <p className="text-[10px] text-amber-700 uppercase font-bold mb-1">Soil Classification</p>
-                                    <p className="text-lg font-bold text-amber-900">{result.prediction.soil_type}</p>
-                                    <p className="text-xs text-amber-600 mt-1">
-                                        Clay: {result.data.clay.toFixed(0)}% | Sand: {result.data.sand.toFixed(0)}% | Silt: {result.data.silt.toFixed(0)}%
-                                    </p>
-                                </div>
-                            )}
+const classifySoilTexture = (clay, sand, silt) => {
+  if (clay < 0 || sand < 0 || silt < 0) {
+    throw new Error("Inputs cannot be negative");
+  }
 
-                            <div>
-                                <h3 className="text-xs font-bold text-slate-400 uppercase mb-2 flex items-center gap-1">
-                                    {result.isSimulated ? "⚗️ Simulated Weather" : "🌤️ Live Weather"}
-                                </h3>
-                                <div className="grid grid-cols-3 gap-2">
-                                    <StatBox label="Temp" value={`${result.data.temp}°C`} />
-                                    <StatBox label="Humidity" value={`${result.data.humidity}%`} />
-                                    <div className={`p-2 rounded border ${result.isSimulated ? 'bg-cyan-50 border-cyan-300' : 'bg-slate-50 border-slate-200'}`}>
-                                        <p className={`text-[10px] uppercase tracking-wide font-bold ${result.isSimulated ? 'text-cyan-600' : 'text-slate-400'}`}>Rainfall</p>
-                                        <p className={`text-lg font-bold ${result.isSimulated ? 'text-cyan-700' : 'text-slate-700'}`}>{getRainDisplay(result)}</p>
-                                    </div>
-                                </div>
-                            </div>
+  const sum = clay + sand + silt;
+  if (sum === 0) return "Unknown";
 
-                            <div>
-                                <h3 className="text-xs font-bold text-slate-400 uppercase mb-2 flex items-center gap-1">
-                                    ⛰️ Terrain Analysis
-                                </h3>
-                                <div className="grid grid-cols-2 gap-2">
-                                    <StatBox 
-                                        label="Slope Angle" 
-                                        value={`${result.data.slope}°`} 
-                                        warning={result.data.slope > 25}
-                                    />
-                                    <StatBox label="Elevation" value={`${Math.round(result.data.elevation)}m`} />
-                                </div>
-                            </div>
+  const nClay = (clay / sum) * 100;
+  const nSand = (sand / sum) * 100;
+  const nSilt = (silt / sum) * 100;
 
-                            <div>
-                                <h3 className="text-xs font-bold text-slate-400 uppercase mb-2 flex items-center gap-1">
-                                    🔬 Soil Physics
-                                </h3>
-                                <div className="grid grid-cols-2 gap-2">
-                                    <StatBox label="Cohesion (c)" value={`${result.prediction.details.cohesion} kPa`} />
-                                    <StatBox label="Friction (φ)" value={getFrictionDisplay(result)} />
-                                    <StatBox 
-                                        label="Shear Strength" 
-                                        value={`${result.prediction.details.shear_strength} kPa`}
-                                        highlight={true}
-                                    />
-                                    <StatBox 
-                                        label="Shear Stress" 
-                                        value={`${result.prediction.details.shear_stress} kPa`}
-                                        warning={parseFloat(result.prediction.details.shear_stress) > parseFloat(result.prediction.details.shear_strength)}
-                                    />
-                                </div>
-                                {result.prediction.details.depth && (
-                                    <p className="text-[10px] text-slate-500 mt-1">
-                                        Failure depth used: {result.prediction.details.depth} m
-                                    </p>
-                                )}
-                            </div>
+  if (nClay >= 40) {
+    if (nSilt >= 40) return "Silty Clay";
+    if (nSand <= 45) return "Clay";
+    return "Silty Clay";
+  }
 
-                            <div className="bg-blue-50 p-3 rounded-lg border border-blue-200">
-                                <p className="text-[10px] text-blue-600 uppercase font-bold mb-1">📍 Location</p>
-                                <p className="text-xs text-blue-800 font-mono">
-                                    {result.location.lat.toFixed(4)}°N, {result.location.lng.toFixed(4)}°E
-                                </p>
-                            </div>
-                        </div>
-                    </div>
-                )}
-            </div>
+  if (nClay >= 35 && nSand >= 45) {
+    return "Sandy Clay";
+  }
 
-            <MapContainer center={[10.8505, 76.2711]} zoom={8} scrollWheelZoom={true} className="h-full w-full z-0">
-                <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
-                <MapClickHandler setMarker={setMarker} predictRisk={predictRisk} />
-                {marker && <Marker position={marker} />}
-            </MapContainer>
-        </div>
-    );
+  if (nClay >= 27) {
+    if (nSand <= 20) return "Silty Clay Loam";
+    if (nSand <= 45) return "Clay Loam";
+    return "Sandy Clay Loam";
+  }
+
+  if (nClay >= 20) {
+    if (nSilt < 28 && nSand > 45) return "Sandy Clay Loam";
+    if (nSilt >= 50) return "Silt Loam";
+    return "Loam";
+  }
+
+  if (nSilt >= 80 && nClay < 12) {
+    return "Silt";
+  }
+
+  if (nSilt >= 50) {
+    return "Silt Loam";
+  }
+
+  if (nSilt + 1.5 * nClay < 15) {
+    return "Sand";
+  }
+
+  if (nSilt + 2 * nClay < 30) {
+    return "Loamy Sand";
+  }
+
+  if (nSand > 52 || (nClay < 7 && nSilt < 50)) {
+    return "Sandy Loam";
+  }
+
+  return "Loam";
+};
+
+// --- 4. ENHANCED RISK CALCULATION ---
+
+const calculateLandslideRisk = (features, climate) => {
+  const {
+    rain_current,
+    rain_7day,
+    slope,
+    clay: rawClay,
+    sand: rawSand,
+    silt: rawSilt,
+    bulk_density: rawBD,
+    elevation,
+    temp,
+    code,
+    isWater,
+    humidity,
+    wind_speed,
+    organic_carbon: rawOC,
+    ph: rawPH,
+    aspect,
+    depth: rawDepth,
+  } = features;
+
+  const clay = Number.isFinite(rawClay) ? rawClay : 0;
+  const sand = Number.isFinite(rawSand) ? rawSand : 0;
+  const silt = Number.isFinite(rawSilt)
+    ? rawSilt
+    : Math.max(0, 100 - clay - sand);
+  const bulk_density = Number.isFinite(rawBD) ? rawBD : 140;
+  const organic_carbon = Number.isFinite(rawOC) ? rawOC : 0;
+  const ph = Number.isFinite(rawPH) ? rawPH : 7;
+
+  // user-controlled failure depth
+  const z = Number.isFinite(rawDepth) && rawDepth > 0 ? rawDepth : 2.5;
+
+  // --- STEP 1: ENVIRONMENT DETECTION ---
+
+  if (slope === 0 && elevation === 0) {
+    return {
+      level: "Safe",
+      reason: "🌊 Sea / Water Body Detected",
+      environment: "Water Body",
+      soil_type: "Water",
+      details: {
+        FoS: 100,
+        probability: 0,
+        cohesion: 0,
+        friction_angle: 0,
+        shear_strength: 0,
+        shear_stress: 0,
+        pore_pressure: 0,
+        saturation: 0,
+        infiltration_rate: 0,
+        root_cohesion: 0,
+        depth: z,
+      },
+    };
+  }
+
+  if (temp <= 0) {
+    return {
+      level: "High",
+      reason: "🧊 Ice Detected (temperature at or below 0°C)",
+      environment: "Ice / Frozen Surface",
+      soil_type: "Ice",
+      details: {
+        FoS: 0.9,
+        probability: 85.0,
+        cohesion: 0,
+        friction_angle: 0,
+        shear_strength: 0,
+        shear_stress: 0,
+        pore_pressure: 0,
+        saturation: 0,
+        infiltration_rate: 0,
+        root_cohesion: 0,
+        depth: z,
+      },
+    };
+  }
+
+  if (isWater || elevation < -5) {
+    return {
+      level: "Safe",
+      reason: "🌊 Ocean or Large Water Body Detected",
+      environment: "Water Body",
+      soil_type: "N/A",
+      details: {
+        FoS: 100,
+        probability: 0,
+        cohesion: 0,
+        friction_angle: 0,
+        shear_strength: 0,
+        shear_stress: 0,
+        pore_pressure: 0,
+        saturation: 0,
+        infiltration_rate: 0,
+        root_cohesion: 0,
+        depth: z,
+      },
+    };
+  }
+
+  if (climate.permafrost || temp < -10) {
+    const thawRisk = temp > -2 && rain_current > 0;
+    return {
+      level: thawRisk ? "High" : "Low",
+      reason: thawRisk
+        ? "🧊 Permafrost thawing detected - High instability risk"
+        : "❄️ Stable Permafrost Region",
+      environment: "Permafrost",
+      soil_type: "Frozen",
+      details: {
+        FoS: thawRisk ? 0.8 : 3.0,
+        probability: thawRisk ? 0.85 : 0.05,
+        cohesion: 0,
+        friction_angle: 0,
+        shear_strength: 0,
+        shear_stress: 0,
+        pore_pressure: 0,
+        saturation: 0,
+        infiltration_rate: 0,
+        root_cohesion: 0,
+        depth: z,
+      },
+    };
+  }
+
+  const isSnow =
+    [71, 73, 75, 77, 85, 86].includes(code) || (temp < 2 && rain_current > 0);
+  if (isSnow && slope > 20) {
+    return {
+      level: slope > 35 ? "Extreme" : "High",
+      reason: `❄️ Snow accumulation on ${slope.toFixed(1)}° slope - Avalanche risk`,
+      environment: "Snow-covered",
+      soil_type: "Snow/Ice",
+      details: {
+        FoS: slope > 35 ? 0.7 : 1.1,
+        probability: slope > 35 ? 0.95 : 0.7,
+        cohesion: 0,
+        friction_angle: 0,
+        shear_strength: 0,
+        shear_stress: 0,
+        pore_pressure: 0,
+        saturation: 0,
+        infiltration_rate: 0,
+        root_cohesion: 0,
+        depth: z,
+      },
+    };
+  }
+
+  // --- STEP 2: SOIL CLASSIFICATION ---
+
+  const soilTexture = classifySoilTexture(clay, sand, silt);
+
+  // --- STEP 3: ADVANCED GEOTECHNICAL PARAMETERS ---
+
+  const fClay = clay / 100;
+  const fSand = sand / 100;
+  const fSilt = silt / 100;
+
+  let c_base = fClay * 45 + fSilt * 12 + fSand * 0.5;
+  let c_organic = Math.min(organic_carbon * 2, 10);
+  let c_dry = c_base + c_organic;
+
+  const saturation = Math.min(rain_7day / 100, 1.0);
+  let c = c_dry * (1 - saturation * fClay * 0.4);
+
+  let phi_base = fSand * 38 + fSilt * 32 + fClay * 18;
+  let phi = phi_base + (bulk_density / 1000) * 5;
+
+  if (!Number.isFinite(phi)) {
+    phi = 30;
+  }
+
+  let root_cohesion = 0;
+  if (climate.vegetation === "dense") root_cohesion = 15;
+  else if (climate.vegetation === "moderate") root_cohesion = 8;
+  else if (climate.vegetation === "sparse") root_cohesion = 3;
+
+  c += root_cohesion;
+
+  const rainfall_intensity = rain_current * 10;
+  const antecedent_moisture = Math.min(rain_7day / 150, 1.0);
+
+  let infiltration_rate = fSand * 30 + fSilt * 10 + fClay * 2;
+  const excess_rain = Math.max(0, rainfall_intensity - infiltration_rate);
+
+  const gamma = (bulk_density / 100) * 9.81;
+  const beta = slope * (Math.PI / 180);
+
+  const sigma = gamma * z * Math.pow(Math.cos(beta), 2);
+  const tau_driving = gamma * z * Math.sin(beta) * Math.cos(beta);
+
+  let u = 0;
+  const base_saturation = antecedent_moisture * 0.5;
+  const intensity_factor = Math.min(excess_rain / 20, 0.5);
+  const clay_retention = fClay * 0.3;
+
+  u = sigma * (base_saturation + intensity_factor + clay_retention);
+  u = Math.min(u, sigma * 0.9);
+  if (!Number.isFinite(u)) u = 0;
+
+  const sigma_effective = Math.max(0, sigma - u);
+  const tanPhi = Math.tan(phi * (Math.PI / 180));
+  const tau_resisting = c + sigma_effective * tanPhi;
+
+  let FoS = tau_resisting / (tau_driving + 0.01);
+  if (!Number.isFinite(FoS)) FoS = 15;
+
+  let probability = 0;
+
+  if (slope < 5) {
+    FoS = 15.0;
+    probability = 0.0;
+  } else if (slope < 15) {
+    if (FoS < 1.0) probability = 0.6;
+    else if (FoS < 1.5) probability = 0.25;
+    else probability = 0.05;
+  } else if (slope < 30) {
+    if (FoS < 1.0) probability = 0.9;
+    else if (FoS < 1.3) probability = 0.7;
+    else if (FoS < 1.7) probability = 0.35;
+    else probability = 0.1;
+  } else {
+    if (FoS < 1.0) probability = 0.98;
+    else if (FoS < 1.2) probability = 0.85;
+    else if (FoS < 1.5) probability = 0.55;
+    else probability = 0.2;
+  }
+
+  if (rainfall_intensity > 30) probability = Math.min(probability * 1.4, 0.99);
+  if (rain_7day > 150) probability = Math.min(probability * 1.3, 0.99);
+
+  let level = "Low";
+  if (probability > 0.75) level = "Extreme";
+  else if (probability > 0.5) level = "High";
+  else if (probability > 0.25) level = "Medium";
+
+  let factors = [];
+
+  if (slope > 45)
+    factors.push(
+      `⚠️ Very steep slope (${slope.toFixed(1)}°) - Highly unstable`,
+    );
+  else if (slope > 30)
+    factors.push(`Steep slope (${slope.toFixed(1)}°) increases risk`);
+  else if (slope < 8)
+    factors.push(`Gentle slope (${slope.toFixed(1)}°) - Stable terrain`);
+  else factors.push(`Moderate slope (${slope.toFixed(1)}°)`);
+
+  factors.push(
+    `Soil: ${soilTexture} (${clay.toFixed(0)}% clay, ${sand.toFixed(0)}% sand)`,
+  );
+
+  if (soilTexture.includes("Clay") && rain_7day > 50) {
+    factors.push(`Clay soil retains water - Reduced friction`);
+  } else if (soilTexture.includes("Sand") && rain_7day > 100) {
+    factors.push(`Sandy soil drains quickly but lacks cohesion`);
+  }
+
+  if (rainfall_intensity > 40) {
+    factors.push(
+      `🌧️ Extreme rainfall intensity (${rain_current.toFixed(1)} mm/hr)`,
+    );
+  } else if (rain_7day > 150) {
+    factors.push(
+      `💧 Prolonged rainfall (${rain_7day.toFixed(0)}mm over 7 days) - Saturated soil`,
+    );
+  } else if (rain_7day > 75) {
+    factors.push(`Moderate cumulative rainfall (${rain_7day.toFixed(0)}mm)`);
+  }
+
+  if (root_cohesion > 10) {
+    factors.push(
+      `🌳 Dense vegetation provides root reinforcement (+${root_cohesion.toFixed(0)} kPa)`,
+    );
+  }
+
+  if (FoS < 1.0) {
+    factors.push(
+      `❌ FAILURE IMMINENT (FoS: ${FoS.toFixed(2)}) - Slope cannot support itself`,
+    );
+  } else if (FoS < 1.3) {
+    factors.push(
+      `⚠️ Critical stability (FoS: ${FoS.toFixed(2)}) - High failure risk`,
+    );
+  } else if (FoS < 1.7) {
+    factors.push(
+      `⚡ Marginal stability (FoS: ${FoS.toFixed(2)}) - Vulnerable to triggers`,
+    );
+  } else {
+    factors.push(`✓ Stable conditions (FoS: ${FoS.toFixed(2)})`);
+  }
+
+  const reason = factors.join(" • ");
+
+  const sigmaSafe = sigma > 0 && Number.isFinite(sigma) ? sigma : 1;
+  const porePct = Number.isFinite(u / sigmaSafe) ? (u / sigmaSafe) * 100 : 0;
+
+  return {
+    level,
+    reason,
+    environment: climate.zone,
+    soil_type: soilTexture,
+    details: {
+      FoS: parseFloat(FoS.toFixed(2)),
+      probability: parseFloat((probability * 100).toFixed(1)),
+      cohesion: parseFloat(c.toFixed(1)),
+      friction_angle: Number.isFinite(phi) ? parseFloat(phi.toFixed(1)) : 30.0,
+      shear_strength: parseFloat(tau_resisting.toFixed(1)),
+      shear_stress: parseFloat(tau_driving.toFixed(1)),
+      pore_pressure: parseFloat(porePct.toFixed(0)),
+      saturation: parseFloat((antecedent_moisture * 100).toFixed(0)),
+      infiltration_rate: parseFloat(infiltration_rate.toFixed(1)),
+      root_cohesion: parseFloat(root_cohesion.toFixed(1)),
+      depth: parseFloat(z.toFixed(2)),
+    },
+  };
+};
+
+// --- 5. MAIN ROUTE ---
+
+app.post("/predict", async (req, res) => {
+  const { lat, lng, manualRain, depth } = req.body;
+  console.log(
+    `\n📍 Analysis: ${lat}, ${lng} | Rain Override: ${manualRain ?? "Live"} | Depth: ${depth ?? "default"}`,
+  );
+
+  try {
+    const depthVal = depth ?? 2.5;
+    const [weather, soil, topo] = await Promise.all([
+      fetchWeather(lat, lng),
+      fetchSoil(lat, lng, depthVal),
+      calculateSlope(lat, lng),
+    ]);
+
+    let features = { ...weather, ...soil, ...topo, depth: depthVal };
+    let isSimulated = false;
+
+    if (manualRain !== null && manualRain !== undefined) {
+      features.rain_current = manualRain;
+      features.rain_7day = manualRain * 7;
+      isSimulated = true;
+    }
+
+    const climate = getKoppenClimate(
+      lat,
+      features.temp,
+      features.temp_max,
+      features.temp_min,
+      features.rain_7day,
+    );
+
+    const prediction = calculateLandslideRisk(features, climate);
+
+    console.log(
+      `🌍 Climate: ${climate.zone} | Vegetation: ${climate.vegetation}`,
+    );
+    console.log(
+      `🏔️ Topography: ${features.elevation}m elevation, ${features.slope}° slope`,
+    );
+    console.log(
+      `🧪 Soil: ${prediction.soil_type} (Clay: ${features.clay?.toFixed?.(0) ?? "N/A"}%, Sand: ${features.sand?.toFixed?.(0) ?? "N/A"}%) | Source: ${features.soilType ?? "default"}`,
+    );
+    console.log(
+      `💧 Rainfall: Current ${features.rain_current}mm | 7-day: ${features.rain_7day.toFixed(0)}mm`,
+    );
+    console.log(
+      `📊 Result: ${prediction.level} Risk (FoS: ${prediction.details.FoS}, Probability: ${prediction.details.probability}%)`,
+    );
+
+    res.json({
+      location: { lat, lng },
+      climate: climate,
+      data: features,
+      prediction: prediction,
+      isSimulated: isSimulated,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.error("❌ Analysis Failed:", error);
+    res.status(500).json({ error: "Analysis failed", message: error.message });
+  }
+});
+
+// ===== EXPORTS & SERVER START =====
+
+// Export app for Vercel serverless
+module.exports = app;
+
+// Listen only if running locally
+const PORT = process.env.PORT || 5000;
+if (process.env.NODE_ENV !== "production") {
+  app.listen(PORT, () => {
+    console.log(`✅ Enhanced Landslide Prediction Engine v2.0`);
+    console.log(`🚀 Server running on port ${PORT}`);
+    console.log(
+      `📡 Features: Climate Classification | USDA Soil Texture | Advanced Physics`,
+    );
+    console.log(`🔗 CORS enabled for all origins`);
+  });
 }
-
-function StatBox({ label, value, warning = false, highlight = false }) {
-    return (
-        <div className={`p-2 rounded border ${
-            warning ? 'bg-red-50 border-red-300' : 
-            highlight ? 'bg-green-50 border-green-300' :
-            'bg-slate-50 border-slate-200'
-        }`}>
-            <p className={`text-[10px] uppercase tracking-wide font-bold ${
-                warning ? 'text-red-600' : 
-                highlight ? 'text-green-600' :
-                'text-slate-400'
-            }`}>{label}</p>
-            <p className={`text-lg font-bold ${
-                warning ? 'text-red-700' : 
-                highlight ? 'text-green-700' :
-                'text-slate-700'
-            }`}>{value}</p>
-        </div>
-    );
-}
-
-export default App;
