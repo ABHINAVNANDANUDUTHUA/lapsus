@@ -25,7 +25,7 @@ app.use('/predict', rateLimit({
 const clamp = (v, min, max) => Math.min(Math.max(v, min), max);
 
 /* =========================
-   TOPOGRAPHY (GEODESIC SLOPE)
+   TOPOGRAPHY
 ========================= */
 
 const calculateSlope = async (lat, lon) => {
@@ -81,21 +81,42 @@ const fetchWeather = async (lat, lon) => {
 };
 
 /* =========================
-   SSI: DEPTH → STRENGTH
+   CONTINUOUS SSI MODEL
 ========================= */
 
 const getSSI = (depth) => {
-  if (depth < 1) return 0.35;
-  if (depth < 3) return 0.65;   // cemented laterite peak
-  if (depth < 7) return 0.50;
-  return 0.30;                 // weathered rock
+  // Smooth depth-normalized SSI (Kerala-calibrated)
+  return clamp(0.75 * Math.exp(-depth / 6) + 0.2, 0.25, 0.85);
 };
 
-const SSItoStrength = (ssi) => ({
-  c: 10 + ssi * 35,            // kPa → 10–45
-  phi: 26 + ssi * 10,          // deg → 26–36
-  gamma: 14 + ssi * 4          // kN/m³ → 14–18
-});
+const SSItoStrength = (ssi, m, depth) => {
+
+  // Base strength from SSI
+  let c = 10 + ssi * 35;       // 10–45 kPa
+  let phi = 26 + ssi * 10;     // 26–36°
+
+  // φ–c coupling (real soil behavior)
+  phi -= 0.05 * (c - 25);
+
+  // Moisture-dependent φ reduction
+  phi *= (1 - 0.1 * m);
+
+  // Regolith weakening at depth > 8 m
+  if (depth > 8) c *= 0.8;
+
+  // Bias correction from PDF residuals
+  c *= 0.9;
+  phi *= 1.05;
+
+  // Unit weight
+  const gamma = 14 + ssi * 4 + (m * 0.35 * 9.81);
+
+  return {
+    c: clamp(c, 8, 45),
+    phi: clamp(phi, 26, 38),
+    gamma
+  };
+};
 
 /* =========================
    PHYSICS ENGINE
@@ -108,10 +129,6 @@ const analyzeLandslideRisk = (topo, weather, depth) => {
   }
 
   depth = clamp(depth, 0.5, 15);
-
-  const ssi = getSSI(depth);
-  const { c, phi, gamma: gamma_dry } = SSItoStrength(ssi);
-
   const beta = topo.slope * Math.PI / 180;
 
   // Rainfall → saturation (0–200 mm)
@@ -119,7 +136,8 @@ const analyzeLandslideRisk = (topo, weather, depth) => {
   const m_evt  = clamp(weather.rain_current / 50, 0, 0.4);
   const m = clamp(0.7 * m_hist + 0.3 * m_evt, 0, 1);
 
-  const gamma = gamma_dry + (m * 0.35 * 9.81);
+  const ssi = getSSI(depth);
+  const { c, phi, gamma } = SSItoStrength(ssi, m, depth);
 
   const tau_d = gamma * depth * Math.sin(beta) * Math.cos(beta);
 
@@ -180,10 +198,10 @@ app.post('/predict', async (req, res) => {
     },
     prediction: {
       ...analysis,
-      model: "Kerala SSI-Calibrated Infinite Slope",
+      model: "Kerala SSI-Calibrated Infinite Slope (Final)",
       depth_range_m: "0–15",
       rainfall_range_mm: "0–200",
-      disclaimer: "Regional assessment only"
+      disclaimer: "Regional-scale assessment only"
     }
   });
 });
@@ -193,5 +211,5 @@ app.post('/predict', async (req, res) => {
 ========================= */
 
 app.listen(PORT, () =>
-  console.log(`🚀 Kerala SSI Landslide Engine running on port ${PORT}`)
+  console.log(`🚀 Kerala SSI Landslide Engine (FINAL) running on port ${PORT}`)
 );
