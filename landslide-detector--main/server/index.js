@@ -1,294 +1,226 @@
-/****************************************************
- * KERALA LANDSLIDE PREDICTION ENGINE – FINAL
- * GeoTIFF + SoilGrids + PDF-Calibrated Physics
- * SINGLE FILE VERSION
- ****************************************************/
-
-require("dotenv").config();
-
-const express = require("express");
-const cors = require("cors");
-const axios = require("axios");
-const fs = require("fs");
-const rateLimit = require("express-rate-limit");
-const GeoTIFF = require("geotiff");
-const { parse } = require("csv-parse/sync");
-
-/* ================= BASIC SETUP ================= */
+const express = require('express');
+const cors = require('cors');
+const axios = require('axios');
+const rateLimit = require('express-rate-limit');
+const fs = require('fs');
+const { parse } = require('csv-parse/sync');
 
 const app = express();
 const PORT = 5000;
 
-app.use(cors());
+/* =========================
+   MIDDLEWARE
+========================= */
+
 app.use(express.json());
-app.use("/predict", rateLimit({ windowMs: 15 * 60 * 1000, max: 100 }));
+app.use(cors({ origin: '*', methods: ['POST'] }));
+
+app.use('/predict', rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100
+}));
+
+/* =========================
+   UTILS
+========================= */
 
 const clamp = (v, min, max) => Math.min(Math.max(v, min), max);
 
-/* ================= LOAD CSV (PDF CALIBRATION) ================= */
+/* =========================
+   LOAD CALIBRATION CSV
+========================= */
 
-const csvText = fs.readFileSync(
-  "data/kerala_soil_calibration_dataset.csv",
-  "utf8"
+const soilCSV = fs.readFileSync(
+  './data/kerala_soil_calibration_dataset.csv',
+  'utf8'
 );
 
-const SOIL_TABLE = parse(csvText, {
+const SOIL_TABLE = parse(soilCSV, {
   columns: true,
   skip_empty_lines: true
 });
 
-function getStrengthFromCSV(depth) {
+/* =========================
+   GET SOIL PROPERTIES BY DEPTH
+========================= */
+
+const getSoilFromCSV = (depth) => {
   const row = SOIL_TABLE.find(
-    r => depth >= +r.depth_min_m && depth < +r.depth_max_m
+    r => depth >= parseFloat(r.depth_min_m) &&
+         depth < parseFloat(r.depth_max_m)
   );
 
   if (!row) {
-    return { c: 25, phi: 30, gamma: 16 };
+    // fallback (should not happen)
+    return {
+      cohesion: 25,
+      phi: 32,
+      gamma: 16
+    };
   }
 
   return {
-    c: +row.cohesion_kPa,
-    phi: +row.friction_angle_deg,
-    gamma: +row.bulk_density_g_per_cm3 * 9.81
+    cohesion: parseFloat(row.cohesion_kPa),
+    phi: parseFloat(row.friction_angle_deg),
+    gamma: parseFloat(row.bulk_density_g_per_cm3) * 9.81
   };
-}
-
-/* ================= LOAD GEOTIFF SOIL MAPS ================= */
-
-const SOIL_TIFS = {
-  clayey: "data/soils/fclayey.tif",
-  claySkeletal: "data/soils/fclayskeletal.tif",
-  loamy: "data/soils/floamy.tif",
-  sandy: "data/soils/fsandy.tif"
 };
 
-const soilRasters = {};
+/* =========================
+   TOPOGRAPHY (SLOPE)
+========================= */
 
-async function loadTiff(filePath) {
-  const buffer = fs.readFileSync(filePath);
-  const tiff = await GeoTIFF.fromArrayBuffer(buffer.buffer);
-  const image = await tiff.getImage();
-  const raster = await image.readRasters();
+const calculateSlope = async (lat, lon) => {
+  try {
+    const offset = 0.001;
+    const url = `https://api.open-meteo.com/v1/elevation?latitude=${lat},${lat+offset},${lat-offset},${lat},${lat}&longitude=${lon},${lon},${lon},${lon+offset},${lon-offset}`;
+    const res = await axios.get(url, { timeout: 5000 });
+    const e = res.data.elevation;
+    if (!e || e.includes(null)) throw new Error();
 
-  return {
-    data: raster[0],
-    width: image.getWidth(),
-    height: image.getHeight(),
-    bbox: image.getBoundingBox()
-  };
-}
+    const [hC, hN, hS, hE, hW] = e;
+    const R = 6378137;
+    const d = offset * Math.PI / 180;
+    const latR = lat * Math.PI / 180;
 
-async function initSoilTiffs() {
-  for (const key of Object.keys(SOIL_TIFS)) {
-    soilRasters[key] = await loadTiff(SOIL_TIFS[key]);
+    const dy = R * d * 2;
+    const dx = R * d * Math.cos(latR) * 2;
+
+    const dzdx = (hE - hW) / dx;
+    const dzdy = (hN - hS) / dy;
+
+    const slope = Math.atan(Math.sqrt(dzdx**2 + dzdy**2)) * 180 / Math.PI;
+
+    return {
+      elevation: hC,
+      slope: +slope.toFixed(2),
+      valid: true
+    };
+  } catch {
+    return { elevation: null, slope: null, valid: false };
   }
-  console.log("✅ GeoTIFF soil maps loaded");
-}
+};
 
-function getRasterValue(r, lat, lon) {
-  const [xmin, ymin, xmax, ymax] = r.bbox;
+/* =========================
+   WEATHER
+========================= */
 
-  const px = Math.floor(((lon - xmin) / (xmax - xmin)) * r.width);
-  const py = Math.floor(((ymax - lat) / (ymax - ymin)) * r.height);
+const fetchWeather = async (lat, lon) => {
+  try {
+    const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=precipitation&daily=precipitation_sum&past_days=7&forecast_days=0`;
+    const res = await axios.get(url, { timeout: 5000 });
 
-  if (px < 0 || py < 0 || px >= r.width || py >= r.height) return null;
-  return r.data[py * r.width + px];
-}
+    const rain7 = (res.data.daily.precipitation_sum || [])
+      .reduce((a, b) => a + (b || 0), 0);
 
-function detectSoilClass(lat, lon) {
-  for (const key of Object.keys(soilRasters)) {
-    const v = getRasterValue(soilRasters[key], lat, lon);
-    if (v === 1) return key;
+    return {
+      rain_current: res.data.current.precipitation || 0,
+      rain_7day: rain7
+    };
+  } catch {
+    return { rain_current: 0, rain_7day: 0 };
   }
-  return "unknown";
-}
+};
 
-/* ================= SOILGRIDS API ================= */
+/* =========================
+   PHYSICS ENGINE (CSV CALIBRATED)
+========================= */
 
-const SOILGRIDS_KEY = process.env.SOILGRIDS_API_KEY;
+const analyzeLandslideRisk = (topo, weather, depth) => {
 
-async function fetchSoilGrids(lat, lon) {
-  const url =
-    `https://rest.isric.org/soilgrids/v2.0/properties/query` +
-    `?lat=${lat}&lon=${lon}` +
-    `&property=clay&property=sand&property=silt&depth=0-5cm`;
-
-  const r = await axios.get(url, {
-    headers: { Authorization: `Bearer ${SOILGRIDS_KEY}` },
-    timeout: 6000
-  });
-
-  const layers = r.data.properties.layers;
-  const get = n =>
-    layers.find(l => l.name === n)?.depths[0]?.values.mean / 10;
-
-  return {
-    clay: get("clay"),
-    sand: get("sand"),
-    silt: get("silt")
-  };
-}
-
-/* ================= SOIL COMPOSITION FUSION ================= */
-
-function fuseSoilComposition(soilClass, sg, depth) {
-
-  // Base regional composition (Kerala)
-  const BASE = {
-    clayey:        { clay: 50, sand: 30 },
-    claySkeletal:  { clay: 35, sand: 40 },
-    loamy:         { clay: 30, sand: 35 },
-    sandy:         { clay: 10, sand: 70 },
-    unknown:       { clay: 30, sand: 35 }
-  };
-
-  let clay = BASE[soilClass]?.clay ?? 30;
-  let sand = BASE[soilClass]?.sand ?? 35;
-
-  // Fuse SoilGrids softly
-  if (sg && sg.clay && sg.sand) {
-    clay = 0.6 * clay + 0.4 * sg.clay;
-    sand = 0.6 * sand + 0.4 * sg.sand;
+  if (!topo.valid || topo.slope < 5 || topo.slope > 45) {
+    return { level: "Invalid", reason: "Model not applicable" };
   }
 
-  // Enforce class constraints
-  if (soilClass === "clayey") clay = clamp(clay, 40, 70);
-  if (soilClass === "sandy") clay = clamp(clay, 5, 20);
+  depth = clamp(depth, 0.5, 15);
+  const beta = topo.slope * Math.PI / 180;
 
-  // Depth adjustment (cementation zone)
-  if (depth > 3) clay *= 0.9;
-  if (depth > 7) clay *= 0.85;
+  // Get calibrated soil values from CSV
+  let { cohesion, phi, gamma } = getSoilFromCSV(depth);
 
-  sand = clamp(sand, 10, 80);
-  const silt = 100 - clay - sand;
+  // Rainfall → saturation
+  const m_hist = clamp(weather.rain_7day / 200, 0, 0.8);
+  const m_evt  = clamp(weather.rain_current / 50, 0, 0.4);
+  const m = clamp(0.7 * m_hist + 0.3 * m_evt, 0, 1);
 
-  return {
-    clay: Math.round(clay),
-    sand: Math.round(sand),
-    silt: Math.round(silt),
-    label: soilClass,
-    source: "GeoTIFF + SoilGrids (fused)"
-  };
-}
+  // Moisture correction
+  phi *= (1 - 0.1 * m);
+  gamma += m * 0.35 * 9.81;
 
-/* ================= TOPOGRAPHY ================= */
+  // Driving stress
+  const tau_d = gamma * depth * Math.sin(beta) * Math.cos(beta);
 
-async function calculateSlope(lat, lon) {
-  const o = 0.001;
-  const url =
-    `https://api.open-meteo.com/v1/elevation?latitude=${lat},${lat+o},${lat-o},${lat},${lat}` +
-    `&longitude=${lon},${lon},${lon},${lon+o},${lon-o}`;
+  // Pore pressure
+  let u = 9.81 * m * depth * Math.cos(beta)**2;
+  u = Math.min(u, 0.6 * gamma * depth);
 
-  const r = await axios.get(url);
-  const e = r.data.elevation;
+  // Resisting stress
+  const sigma_eff = Math.max(0, gamma * depth * Math.cos(beta)**2 - u);
+  const tau_r = cohesion + sigma_eff * Math.tan(phi * Math.PI / 180);
 
-  const R = 6378137;
-  const d = o * Math.PI / 180;
-  const latR = lat * Math.PI / 180;
+  const FoS = tau_r / tau_d;
 
-  const dy = R * d * 2;
-  const dx = R * d * Math.cos(latR) * 2;
-
-  const dzdx = (e[3] - e[4]) / dx;
-  const dzdy = (e[1] - e[2]) / dy;
+  let level = "Low", probability = 5;
+  if (FoS < 1) [level, probability] = ["Extreme", 95];
+  else if (FoS < 1.25) [level, probability] = ["High", 75];
+  else if (FoS < 1.5) [level, probability] = ["Medium", 40];
 
   return {
-    elevation: e[0],
-    slope: Math.atan(Math.sqrt(dzdx**2 + dzdy**2)) * 180 / Math.PI
+    level,
+    physics: {
+      FoS: +FoS.toFixed(2),
+      probability,
+      cohesion: +cohesion.toFixed(1),
+      friction_angle: +phi.toFixed(1),
+      unit_weight: +gamma.toFixed(1),
+      saturation_ratio: +m.toFixed(2)
+    }
   };
-}
+};
 
-/* ================= WEATHER ================= */
+/* =========================
+   API ENDPOINT
+========================= */
 
-async function fetchWeather(lat, lon) {
-  const url =
-    `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
-    `&current=precipitation&daily=precipitation_sum&past_days=7&forecast_days=0`;
-
-  const r = await axios.get(url);
-
-  return {
-    rain_now: r.data.current.precipitation || 0,
-    rain_7day: (r.data.daily.precipitation_sum || []).reduce(
-      (a, b) => a + (b || 0), 0
-    )
-  };
-}
-
-/* ================= PHYSICS ================= */
-
-function analyzeSlope(slopeDeg, depth, strength, weather) {
-  const beta = slopeDeg * Math.PI / 180;
-  const m = clamp(
-    0.7 * (weather.rain_7day / 200) +
-    0.3 * (weather.rain_now / 50),
-    0, 1
-  );
-
-  const gamma = strength.gamma + m * 0.35 * 9.81;
-  const u = Math.min(
-    9.81 * m * depth * Math.cos(beta)**2,
-    0.6 * gamma * depth
-  );
-
-  const tau = gamma * depth * Math.sin(beta) * Math.cos(beta);
-  const sigma = Math.max(0, gamma * depth * Math.cos(beta)**2 - u);
-  const tau_r = strength.c + sigma * Math.tan(strength.phi * Math.PI / 180);
-
-  const FoS = tau_r / tau;
-
-  let level = "Low";
-  if (FoS < 1) level = "Extreme";
-  else if (FoS < 1.25) level = "High";
-  else if (FoS < 1.5) level = "Medium";
-
-  return {
-    FoS: +FoS.toFixed(2),
-    shear_stress: +tau.toFixed(2),
-    shear_strength: +tau_r.toFixed(2),
-    level
-  };
-}
-
-/* ================= API ================= */
-
-app.post("/predict", async (req, res) => {
+app.post('/predict', async (req, res) => {
 
   const { lat, lng, depth = 2.5 } = req.body;
+
+  if (
+    typeof lat !== 'number' || lat < 8 || lat > 13.5 ||
+    typeof lng !== 'number' || lng < 74 || lng > 78
+  ) {
+    return res.status(400).json({ error: "Invalid Kerala coordinates" });
+  }
 
   const [topo, weather] = await Promise.all([
     calculateSlope(lat, lng),
     fetchWeather(lat, lng)
   ]);
 
-  const soilClass = detectSoilClass(lat, lng);
-  const sg = await fetchSoilGrids(lat, lng).catch(() => null);
-  const composition = fuseSoilComposition(soilClass, sg, depth);
-
-  const strength = getStrengthFromCSV(depth);
-  const physics = analyzeSlope(topo.slope, depth, strength, weather);
+  const analysis = analyzeLandslideRisk(topo, weather, depth);
 
   res.json({
-    location: { lat, lng, elevation: topo.elevation },
-    terrain: { slope: +topo.slope.toFixed(2) },
-    soil: {
-      class: soilClass,
-      composition
+    location: {
+      lat, lng,
+      elevation: topo.elevation,
+      slope: topo.slope
     },
-    physics: {
-      cohesion_kPa: strength.c,
-      friction_deg: strength.phi,
-      ...physics
-    },
-    depth_used_m: depth,
-    model: "Kerala GeoTIFF + SoilGrids + PDF Calibrated Engine (SINGLE FILE)"
+    prediction: {
+      ...analysis,
+      model: "Kerala CSV-Calibrated Infinite Slope (FINAL)",
+      depth_range_m: "0–15",
+      rainfall_range_mm: "0–200",
+      data_source: "GSI PDF compiled calibration dataset",
+      disclaimer: "Regional-scale assessment only"
+    }
   });
 });
 
-/* ================= START ================= */
+/* =========================
+   SERVER
+========================= */
 
-initSoilTiffs().then(() => {
-  app.listen(PORT, () =>
-    console.log(`🚀 FINAL engine running on port ${PORT}`)
-  );
-});
+app.listen(PORT, () =>
+  console.log(`🚀 Kerala CSV-Calibrated Landslide Engine running on port ${PORT}`)
+);
