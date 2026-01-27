@@ -6,58 +6,41 @@ const rateLimit = require('express-rate-limit');
 const app = express();
 const PORT = 5000;
 
-/* ============================
-   0. SECURITY & MIDDLEWARE
-============================ */
+/* =========================
+   SECURITY & MIDDLEWARE
+========================= */
 
 app.use(express.json());
 
-// 🔒 Restrictive CORS
 app.use(cors({
-    origin: ['http://localhost:3000'], // change to your frontend
+    origin: '*', // restrict later if needed
     methods: ['POST']
 }));
 
-// 🔒 Rate Limiting
 app.use('/predict', rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 100
 }));
 
-/* ============================
-   1. UTILS
-============================ */
+/* =========================
+   UTILS
+========================= */
 
-const isValidNumber = (v, min, max) =>
-    typeof v === 'number' && isFinite(v) && v >= min && v <= max;
+const clamp = (v, min, max) => Math.min(Math.max(v, min), max);
 
-/* ============================
-   2. LIGHTWEIGHT CACHE
-============================ */
-
-const topoCache = new Map();
-const soilCache = new Map();
-
-const cacheKey = (lat, lon) =>
-    `${lat.toFixed(4)},${lon.toFixed(4)}`;
-
-/* ============================
-   3. GEODESIC SLOPE CALCULATOR
-============================ */
+/* =========================
+   TOPOGRAPHY (SLOPE)
+========================= */
 
 const calculateSlope = async (lat, lon) => {
-    const key = cacheKey(lat, lon);
-    if (topoCache.has(key)) return topoCache.get(key);
-
     try {
         const offset = 0.001;
         const url = `https://api.open-meteo.com/v1/elevation?latitude=${lat},${lat + offset},${lat - offset},${lat},${lat}&longitude=${lon},${lon},${lon},${lon + offset},${lon - offset}`;
         const res = await axios.get(url, { timeout: 5000 });
+        const e = res.data.elevation;
+        if (!e || e.includes(null)) throw new Error();
 
-        const el = res.data.elevation;
-        if (!el || el.includes(null)) throw new Error("Invalid elevation data");
-
-        const [hC, hN, hS, hE, hW] = el;
+        const [hC, hN, hS, hE, hW] = e;
 
         const R = 6378137;
         const dLat = offset * Math.PI / 180;
@@ -67,41 +50,36 @@ const calculateSlope = async (lat, lon) => {
         const dy = R * dLat * 2;
         const dx = R * dLon * Math.cos(latRad) * 2;
 
-        const dz_dx = (hE - hW) / dx;
-        const dz_dy = (hN - hS) / dy;
+        const dzdx = (hE - hW) / dx;
+        const dzdy = (hN - hS) / dy;
 
-        const rise = Math.sqrt(dz_dx ** 2 + dz_dy ** 2);
-        const slope = Math.atan(rise) * 180 / Math.PI;
-
-        let aspect = Math.atan2(dz_dy, -dz_dx) * 180 / Math.PI;
+        const slope = Math.atan(Math.sqrt(dzdx ** 2 + dzdy ** 2)) * 180 / Math.PI;
+        let aspect = Math.atan2(dzdy, -dzdx) * 180 / Math.PI;
         if (aspect < 0) aspect += 360;
 
-        const result = {
+        return {
             elevation: hC,
             slope: +slope.toFixed(2),
             aspect: +aspect.toFixed(0),
             valid: true
         };
 
-        topoCache.set(key, result);
-        return result;
-
     } catch {
         return { elevation: null, slope: null, aspect: null, valid: false };
     }
 };
 
-/* ============================
-   4. WEATHER
-============================ */
+/* =========================
+   WEATHER (RAIN)
+========================= */
 
 const fetchWeather = async (lat, lon) => {
     try {
         const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=precipitation&daily=precipitation_sum&past_days=7&forecast_days=0`;
         const res = await axios.get(url, { timeout: 5000 });
 
-        const daily = res.data.daily.precipitation_sum || [];
-        const rain7 = daily.reduce((a, b) => a + (b || 0), 0);
+        const rain7 = (res.data.daily.precipitation_sum || [])
+            .reduce((a, b) => a + (b || 0), 0);
 
         return {
             rain_current: res.data.current.precipitation || 0,
@@ -113,158 +91,140 @@ const fetchWeather = async (lat, lon) => {
     }
 };
 
-/* ============================
-   5. SOIL
-============================ */
+/* =========================
+   KERALA SOIL ENVELOPES
+========================= */
 
-const fetchSoil = async (lat, lon) => {
-    const key = cacheKey(lat, lon);
-    if (soilCache.has(key)) return soilCache.get(key);
+const keralaSoilEnvelope = (depth) => {
 
-    try {
-        const url = `https://rest.isric.org/soilgrids/v2.0/properties/query?lat=${lat}&lon=${lon}&property=bdod&property=clay&property=sand&depth=0-5cm`;
-        const res = await axios.get(url, { timeout: 5000 });
-
-        const layers = res.data.properties.layers;
-        const get = n => layers.find(l => l.name === n)?.depths[0]?.values.mean;
-
-        const clay = get('clay');
-        const sand = get('sand');
-        const bd = get('bdod');
-
-        if (!clay || !sand || !bd) throw new Error();
-
-        const soil = {
-            clay: clay / 10,
-            sand: sand / 10,
-            bulk_density: bd,
-            source: "Measured",
-            valid: true
-        };
-
-        soilCache.set(key, soil);
-        return soil;
-
-    } catch {
+    if (depth < 1) {
         return {
-            clay: 35,
-            sand: 45,
-            bulk_density: 145,
-            source: "Default Laterite",
-            valid: false
+            c: [10, 25],
+            phi: [26, 30],
+            gamma: [14, 16]
         };
     }
+    if (depth < 3) {
+        return {
+            c: [20, 45],
+            phi: [30, 34],
+            gamma: [15, 17]
+        };
+    }
+    if (depth < 7) {
+        return {
+            c: [15, 30],
+            phi: [32, 36],
+            gamma: [16, 18]
+        };
+    }
+    return {
+        c: [8, 20],
+        phi: [34, 38],
+        gamma: [18, 21]
+    };
 };
 
-/* ============================
-   6. PHYSICS ENGINE
-============================ */
+/* =========================
+   PHYSICS ENGINE
+========================= */
 
-const analyzeLandslideRisk = (lat, topo, weather, soil, depth = 2) => {
+const analyzeLandslideRisk = (topo, weather, depth) => {
 
     if (!topo.valid || topo.slope < 5 || topo.slope > 45) {
         return { level: "Invalid", reason: "Model not applicable" };
     }
 
+    depth = clamp(depth, 0.5, 15);
+
+    const env = keralaSoilEnvelope(depth);
+
+    const c = (env.c[0] + env.c[1]) / 2;
+    const phi = (env.phi[0] + env.phi[1]) / 2;
+    const gamma_dry = (env.gamma[0] + env.gamma[1]) / 2;
+
     const beta = topo.slope * Math.PI / 180;
     const G = 9.81;
 
-    let gamma_dry = (soil.bulk_density * 10 * G) / 1000;
-    if (gamma_dry < 10) gamma_dry = 16;
+    const saturation_history = clamp(weather.rain_7day / 200, 0, 0.8);
+    const saturation_event = clamp(weather.rain_current / 50, 0, 0.4);
 
-    const n = 0.35;
-    const gamma_sat = gamma_dry + n * 9.81;
+    const m = clamp((0.7 * saturation_history) + (0.3 * saturation_event), 0, 1);
 
-    const m = Math.min(
-        Math.min(weather.rain_7day / 250, 0.8) +
-        Math.min(weather.rain_current / 40, 0.5),
-        1
-    );
-
-    const gamma = m > 0.2 ? gamma_sat : gamma_dry;
-
-    let phi = 30 + soil.sand * 0.1;
-    let c = 5 + soil.clay * 0.2;
-
-    // uncertainty
-    phi *= 0.9 + Math.random() * 0.2;
-    c *= 0.8 + Math.random() * 0.4;
+    const gamma = gamma_dry + (m * 0.35 * 9.81);
 
     const tau_d = gamma * depth * Math.sin(beta) * Math.cos(beta);
 
-    let u = 9.81 * m * depth * Math.cos(beta) ** 2;
-    const u_max = 0.6 * gamma * depth;
-    u = Math.min(u, u_max);
+    let u = 9.81 * m * depth * Math.pow(Math.cos(beta), 2);
+    u = Math.min(u, 0.6 * gamma * depth);
 
-    const sigma_eff = Math.max(0, gamma * depth * Math.cos(beta) ** 2 - u);
+    const sigma_eff = Math.max(0, gamma * depth * Math.pow(Math.cos(beta), 2) - u);
     const tau_r = c + sigma_eff * Math.tan(phi * Math.PI / 180);
 
     const FoS = tau_r / tau_d;
 
-    let level = "Low", prob = 5;
-    if (FoS < 1) [level, prob] = ["Extreme", 95];
-    else if (FoS < 1.25) [level, prob] = ["High", 75];
-    else if (FoS < 1.5) [level, prob] = ["Medium", 40];
-
-    let confidence = 100;
-    if (!soil.valid) confidence -= 30;
-    if (!weather.valid) confidence -= 20;
+    let level = "Low", probability = 5;
+    if (FoS < 1.0) [level, probability] = ["Extreme", 95];
+    else if (FoS < 1.25) [level, probability] = ["High", 75];
+    else if (FoS < 1.5) [level, probability] = ["Medium", 40];
 
     return {
         level,
-        confidence,
         physics: {
             FoS: +FoS.toFixed(2),
-            probability: prob,
+            probability,
             cohesion: +c.toFixed(1),
             friction_angle: +phi.toFixed(1),
-            saturation: +m.toFixed(2)
+            unit_weight: +gamma.toFixed(1),
+            pore_pressure_ratio: +m.toFixed(2)
         }
     };
 };
 
-/* ============================
-   7. API ENDPOINT
-============================ */
+/* =========================
+   API ENDPOINT
+========================= */
 
 app.post('/predict', async (req, res) => {
 
-    const { lat, lng, manualRain, depth } = req.body;
+    const { lat, lng, depth = 2.5 } = req.body;
 
     if (
-        !isValidNumber(lat, -90, 90) ||
-        !isValidNumber(lng, -180, 180)
+        typeof lat !== 'number' || lat < 8 || lat > 13.5 ||
+        typeof lng !== 'number' || lng < 74 || lng > 78
     ) {
-        return res.status(400).json({ error: "Invalid coordinates" });
+        return res.status(400).json({ error: "Invalid Kerala coordinates" });
     }
 
-    const [topo, weather, soil] = await Promise.all([
+    const [topo, weather] = await Promise.all([
         calculateSlope(lat, lng),
-        fetchWeather(lat, lng),
-        fetchSoil(lat, lng)
+        fetchWeather(lat, lng)
     ]);
 
-    if (manualRain !== undefined && isValidNumber(manualRain, 0, 500)) {
-        weather.rain_current = manualRain;
-        weather.rain_7day = manualRain * 5;
-    }
-
-    const analysis = analyzeLandslideRisk(lat, topo, weather, soil, depth);
+    const analysis = analyzeLandslideRisk(topo, weather, depth);
 
     res.json({
-        location: { lat, lng, elevation: topo.elevation },
+        location: {
+            lat,
+            lng,
+            elevation: topo.elevation,
+            slope: topo.slope,
+            aspect: topo.aspect
+        },
         prediction: {
             ...analysis,
-            model: "Infinite Slope (Conceptual)",
-            not_for_design_use: true
+            model: "Kerala-Calibrated Infinite Slope",
+            valid_for_depth_m: "0–15",
+            rainfall_range_mm: "0–200",
+            disclaimer: "Regional-scale assessment only"
         }
     });
 });
 
-/* ============================
-   8. SERVER
-============================ */
+/* =========================
+   SERVER
+========================= */
 
 app.listen(PORT, () =>
-    console.log(`🚀 Landslide Engine running on port ${PORT}`)
+    console.log(`🚀 Kerala Landslide Engine running on port ${PORT}`)
 );
