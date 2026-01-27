@@ -2,6 +2,8 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 const rateLimit = require('express-rate-limit');
+const fs = require('fs');
+const { parse } = require('csv-parse/sync');
 
 const app = express();
 const PORT = 5000;
@@ -25,7 +27,47 @@ app.use('/predict', rateLimit({
 const clamp = (v, min, max) => Math.min(Math.max(v, min), max);
 
 /* =========================
-   TOPOGRAPHY
+   LOAD CALIBRATION CSV
+========================= */
+
+const soilCSV = fs.readFileSync(
+  './data/kerala_soil_calibration_dataset.csv',
+  'utf8'
+);
+
+const SOIL_TABLE = parse(soilCSV, {
+  columns: true,
+  skip_empty_lines: true
+});
+
+/* =========================
+   GET SOIL PROPERTIES BY DEPTH
+========================= */
+
+const getSoilFromCSV = (depth) => {
+  const row = SOIL_TABLE.find(
+    r => depth >= parseFloat(r.depth_min_m) &&
+         depth < parseFloat(r.depth_max_m)
+  );
+
+  if (!row) {
+    // fallback (should not happen)
+    return {
+      cohesion: 25,
+      phi: 32,
+      gamma: 16
+    };
+  }
+
+  return {
+    cohesion: parseFloat(row.cohesion_kPa),
+    phi: parseFloat(row.friction_angle_deg),
+    gamma: parseFloat(row.bulk_density_g_per_cm3) * 9.81
+  };
+};
+
+/* =========================
+   TOPOGRAPHY (SLOPE)
 ========================= */
 
 const calculateSlope = async (lat, lon) => {
@@ -81,45 +123,7 @@ const fetchWeather = async (lat, lon) => {
 };
 
 /* =========================
-   CONTINUOUS SSI MODEL
-========================= */
-
-const getSSI = (depth) => {
-  // Smooth depth-normalized SSI (Kerala-calibrated)
-  return clamp(0.75 * Math.exp(-depth / 6) + 0.2, 0.25, 0.85);
-};
-
-const SSItoStrength = (ssi, m, depth) => {
-
-  // Base strength from SSI
-  let c = 10 + ssi * 35;       // 10–45 kPa
-  let phi = 26 + ssi * 10;     // 26–36°
-
-  // φ–c coupling (real soil behavior)
-  phi -= 0.05 * (c - 25);
-
-  // Moisture-dependent φ reduction
-  phi *= (1 - 0.1 * m);
-
-  // Regolith weakening at depth > 8 m
-  if (depth > 8) c *= 0.8;
-
-  // Bias correction from PDF residuals
-  c *= 0.9;
-  phi *= 1.05;
-
-  // Unit weight
-  const gamma = 14 + ssi * 4 + (m * 0.35 * 9.81);
-
-  return {
-    c: clamp(c, 8, 45),
-    phi: clamp(phi, 26, 38),
-    gamma
-  };
-};
-
-/* =========================
-   PHYSICS ENGINE
+   PHYSICS ENGINE (CSV CALIBRATED)
 ========================= */
 
 const analyzeLandslideRisk = (topo, weather, depth) => {
@@ -131,39 +135,45 @@ const analyzeLandslideRisk = (topo, weather, depth) => {
   depth = clamp(depth, 0.5, 15);
   const beta = topo.slope * Math.PI / 180;
 
-  // Rainfall → saturation (0–200 mm)
+  // Get calibrated soil values from CSV
+  let { cohesion, phi, gamma } = getSoilFromCSV(depth);
+
+  // Rainfall → saturation
   const m_hist = clamp(weather.rain_7day / 200, 0, 0.8);
   const m_evt  = clamp(weather.rain_current / 50, 0, 0.4);
   const m = clamp(0.7 * m_hist + 0.3 * m_evt, 0, 1);
 
-  const ssi = getSSI(depth);
-  const { c, phi, gamma } = SSItoStrength(ssi, m, depth);
+  // Moisture correction
+  phi *= (1 - 0.1 * m);
+  gamma += m * 0.35 * 9.81;
 
+  // Driving stress
   const tau_d = gamma * depth * Math.sin(beta) * Math.cos(beta);
 
+  // Pore pressure
   let u = 9.81 * m * depth * Math.cos(beta)**2;
   u = Math.min(u, 0.6 * gamma * depth);
 
+  // Resisting stress
   const sigma_eff = Math.max(0, gamma * depth * Math.cos(beta)**2 - u);
-  const tau_r = c + sigma_eff * Math.tan(phi * Math.PI / 180);
+  const tau_r = cohesion + sigma_eff * Math.tan(phi * Math.PI / 180);
 
   const FoS = tau_r / tau_d;
 
-  let level = "Low", prob = 5;
-  if (FoS < 1) [level, prob] = ["Extreme", 95];
-  else if (FoS < 1.25) [level, prob] = ["High", 75];
-  else if (FoS < 1.5) [level, prob] = ["Medium", 40];
+  let level = "Low", probability = 5;
+  if (FoS < 1) [level, probability] = ["Extreme", 95];
+  else if (FoS < 1.25) [level, probability] = ["High", 75];
+  else if (FoS < 1.5) [level, probability] = ["Medium", 40];
 
   return {
     level,
     physics: {
       FoS: +FoS.toFixed(2),
-      probability: prob,
-      cohesion: +c.toFixed(1),
+      probability,
+      cohesion: +cohesion.toFixed(1),
       friction_angle: +phi.toFixed(1),
       unit_weight: +gamma.toFixed(1),
-      saturation_ratio: +m.toFixed(2),
-      SSI: +ssi.toFixed(2)
+      saturation_ratio: +m.toFixed(2)
     }
   };
 };
@@ -198,9 +208,10 @@ app.post('/predict', async (req, res) => {
     },
     prediction: {
       ...analysis,
-      model: "Kerala SSI-Calibrated Infinite Slope (Final)",
+      model: "Kerala CSV-Calibrated Infinite Slope (FINAL)",
       depth_range_m: "0–15",
       rainfall_range_mm: "0–200",
+      data_source: "GSI PDF compiled calibration dataset",
       disclaimer: "Regional-scale assessment only"
     }
   });
@@ -211,5 +222,5 @@ app.post('/predict', async (req, res) => {
 ========================= */
 
 app.listen(PORT, () =>
-  console.log(`🚀 Kerala SSI Landslide Engine (FINAL) running on port ${PORT}`)
+  console.log(`🚀 Kerala CSV-Calibrated Landslide Engine running on port ${PORT}`)
 );
