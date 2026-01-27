@@ -67,7 +67,7 @@ function App() {
         try {
             const rainToSend = (simMode && manualRainOverride !== null) ? manualRainOverride : (simMode ? rainValue : null);
 
-            const response = await axios.post('https://landslide-detector-backend.vercel.app/predict', {
+            const response = await axios.post('https://lapsus-vzwm.vercel.app/predict', {
                 lat: latlng.lat,
                 lng: latlng.lng,
                 manualRain: rainToSend,
