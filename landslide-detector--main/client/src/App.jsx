@@ -64,10 +64,10 @@ function App() {
         }
     }, [depth]);
 
-    const predictRisk = async (latlng, manualRainOverride = null) => {
-        setLoading(true);
-        try {
-            const rainToSend = (simMode && manualRainOverride !== null) ? manualRainOverride : (simMode ? rainValue : null);
+    const predictRisk = async (latlng, manualRainOverride = null) => {
+        setLoading(true);
+        try {
+            const rainToSend = (simMode && manualRainOverride !== null) ? manualRainOverride : (simMode ? rainValue : null);
 
             const response = await apiClient.post('/predict', {
                 lat: latlng.lat,
@@ -84,39 +84,46 @@ function App() {
             setLoading(false);
         }
     };
-        try {
-            setLoading(true);
-            const res = await axios.get('https://nominatim.openstreetmap.org/search', {
-                params: {
-                    q,
-                    format: 'json',
-                    limit: 1
-                },
-                headers: {
-                    // Nominatim wants some identification; from browser this is best effort
-                    'Accept-Language': 'en'
-                }
-            });
 
-            if (!res.data || res.data.length === 0) {
-                alert("Location not found. Try a more specific name.");
-                return;
-            }
+    const handleLocationSearch = async () => {
+        const q = searchQuery;
+        if (!q.trim()) {
+            alert("Please enter a location to search.");
+            return;
+        }
+        try {
+            setLoading(true);
+            const res = await axios.get('https://nominatim.openstreetmap.org/search', {
+                params: {
+                    q,
+                    format: 'json',
+                    limit: 1
+                },
+                headers: {
+                    // Nominatim wants some identification; from browser this is best effort
+                    'Accept-Language': 'en'
+                }
+            });
 
-            const loc = res.data[0];
-            const lat = parseFloat(loc.lat);
-            const lng = parseFloat(loc.lon);
+            if (!res.data || res.data.length === 0) {
+                alert("Location not found. Try a more specific name.");
+                return;
+            }
 
-            const latlng = { lat, lng };
-            setMarker(latlng);
-            predictRisk(latlng);
-        } catch (err) {
-            console.error(err);
-            alert("Location search failed.");
-        } finally {
-            setLoading(false);
-        }
-    };
+            const loc = res.data[0];
+            const lat = parseFloat(loc.lat);
+            const lng = parseFloat(loc.lon);
+
+            const latlng = { lat, lng };
+            setMarker(latlng);
+            predictRisk(latlng);
+        } catch (err) {
+            console.error(err);
+            alert("Location search failed.");
+        } finally {
+            setLoading(false);
+        }
+    };
 
         const handleUseMyLocation = () => {
         if (!navigator.geolocation) {
